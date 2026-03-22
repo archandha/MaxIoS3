@@ -6,6 +6,21 @@ use std::collections::HashMap;
 use axum::http::StatusCode;
 use crate::{AppState, SigV4Params, S3Error, S3ErrorCode, S3User};
 
+/// URL percent-encode a string (spaces become %20, other special chars become %XX).
+/// Matches the encoding used by minio-go SigV2 canonical resource construction
+/// (url.Values.Encode() with '+' replaced by '%20').
+fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+            b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 pub mod bucket;
 pub mod object;
 pub mod multipart;
@@ -23,6 +38,13 @@ pub async fn validate_auth(
     // SigV2 presigned URL: AWSAccessKeyId + Signature + Expires
     if query_map.contains_key("AWSAccessKeyId") {
         return validate_auth_sigv2(state, method, uri, &query_map).await;
+    }
+
+    // SigV2 header auth: Authorization: AWS access_key:signature
+    if let Some(auth_header) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
+        if auth_header.starts_with("AWS ") && !auth_header.starts_with("AWS4") {
+            return validate_auth_sigv2_header(state, method, uri, query, headers, auth_header).await;
+        }
     }
 
     let params = if let Some(auth_header) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
@@ -74,6 +96,72 @@ pub async fn validate_auth(
     Ok((params, auth_payload_hash.to_string()))
 }
 
+async fn validate_auth_sigv2_header(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    query: &[(String, String)],
+    headers: &axum::http::HeaderMap,
+    auth_header: &str,
+) -> Result<(SigV4Params, String), S3Error> {
+    // Format: "AWS access_key:signature"
+    let rest = &auth_header[4..]; // strip "AWS "
+    let (access_key, signature) = rest.split_once(':')
+        .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Invalid SigV2 Authorization header", StatusCode::FORBIDDEN))?;
+
+    let user: S3User = state.user_meta.get_user(access_key).await?
+        .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Invalid Access Key", StatusCode::FORBIDDEN))?;
+
+    if !user.is_active {
+        return Err(S3Error::new(S3ErrorCode::AccessDenied, "User account is inactive", StatusCode::FORBIDDEN));
+    }
+
+    let mut header_map = HashMap::new();
+    for name in headers.keys() {
+        let hn = name.as_str().to_lowercase();
+        let values: Vec<_> = headers.get_all(name).iter()
+            .map(|v| v.to_str().unwrap_or("").trim())
+            .collect();
+        header_map.insert(hn, values.join(","));
+    }
+
+    // Build canonical resource: path + relevant sub-resources from query
+    // These sub-resources must be included in the SigV2 canonical resource
+    const SIGV2_SUB_RESOURCES: &[&str] = &[
+        "acl", "cors", "delete", "lifecycle", "location", "logging",
+        "notification", "partNumber", "policy", "requestPayment", "restore",
+        "tagging", "torrent", "uploadId", "uploads", "versionId", "versioning",
+        "versions", "website",
+    ];
+    let mut sub_resources: Vec<String> = query.iter()
+        .filter(|(k, _)| SIGV2_SUB_RESOURCES.contains(&k.as_str()))
+        .map(|(k, v)| if v.is_empty() { k.clone() } else { format!("{}={}", k, v) })
+        .collect();
+    sub_resources.sort();
+    let canonical_resource = if sub_resources.is_empty() {
+        uri.to_string()
+    } else {
+        format!("{}?{}", uri, sub_resources.join("&"))
+    };
+
+    let is_valid = state.auth.validate_sigv2_header(method, &canonical_resource, &header_map, signature, &user.secret_key)
+        .map_err(|e| S3Error::internal(e))?;
+
+    if !is_valid {
+        return Err(S3Error::new(S3ErrorCode::SignatureDoesNotMatch, "SigV2 signature mismatch", StatusCode::FORBIDDEN));
+    }
+
+    Ok((SigV4Params {
+        access_key: access_key.to_string(),
+        credential_scope: String::new(),
+        signed_headers: vec![],
+        signature: signature.to_string(),
+        is_presigned: false,
+        expires: None,
+        amz_date: None,
+    }, "UNSIGNED-PAYLOAD".to_string()))
+}
+
 async fn validate_auth_sigv2(
     state: &AppState,
     method: &str,
@@ -94,7 +182,34 @@ async fn validate_auth_sigv2(
         return Err(S3Error::new(S3ErrorCode::AccessDenied, "User account is inactive", StatusCode::FORBIDDEN));
     }
 
-    let is_valid = state.auth.validate_sigv2_presigned(method, uri, expires, signature, &user.secret_key)
+    // Build canonical resource using the same resource list as minio-go.
+    // Values are written as URL-decoded (no re-encoding), matching minio-go's
+    // writeCanonicalizedResource which calls url.ParseQuery (decodes) then writes vv[0] directly.
+    const SIGV2_RESOURCE_LIST: &[&str] = &[
+        "acl", "delete", "lifecycle", "location", "logging", "notification",
+        "partNumber", "policy", "requestPayment",
+        "response-cache-control", "response-content-disposition",
+        "response-content-encoding", "response-content-language",
+        "response-content-type", "response-expires",
+        "torrent", "uploadId", "uploads", "versionId", "versioning", "versions", "website",
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    for resource in SIGV2_RESOURCE_LIST {
+        if let Some(v) = query_map.get(*resource) {
+            if v.is_empty() {
+                parts.push(resource.to_string());
+            } else {
+                parts.push(format!("{}={}", resource, v));
+            }
+        }
+    }
+    let canonical_resource = if parts.is_empty() {
+        uri.to_string()
+    } else {
+        format!("{}?{}", uri, parts.join("&"))
+    };
+
+    let is_valid = state.auth.validate_sigv2_presigned(method, &canonical_resource, expires, signature, &user.secret_key)
         .map_err(|e| S3Error::internal(e))?;
 
     if !is_valid {

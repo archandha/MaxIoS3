@@ -14,6 +14,30 @@ use axum::{
 use crate::{AppState, S3Error, S3ErrorCode, MultipartPart, S3ObjectMetadata, MultipartUpload};
 use super::validate_auth;
 
+/// Decode AWS SigV4 streaming chunked body format.
+/// Each chunk: `{hex-size};chunk-signature={sig}\r\n{data}\r\n`
+/// Final chunk: `0;chunk-signature={sig}\r\n\r\n`
+fn decode_aws_chunked(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let header_end = data[pos..].windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow::anyhow!("Invalid AWS chunked header"))?;
+        let header_bytes = &data[pos..pos + header_end];
+        let header_str = std::str::from_utf8(header_bytes)?;
+        let size_str = header_str.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_str, 16)?;
+        pos += header_end + 2;
+        if chunk_size == 0 {
+            break;
+        }
+        result.extend_from_slice(&data[pos..pos + chunk_size]);
+        pos += chunk_size + 2; // skip data + trailing \r\n
+    }
+    Ok(result)
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename = "CopyObjectResult")]
 #[serde(rename_all = "PascalCase")]
@@ -195,14 +219,23 @@ pub async fn put_handler(
                 .map(|s| s.trim().to_string());
 
             tracing::info!(bucket = %bucket, key = %key, "PUT Object (Streaming)");
-            let (size, md5) = state.storage.put(&bucket, &key, body, &expected_payload_hash).await
-                .map_err(|e| {
-                    if e.to_string().contains("Checksum mismatch") {
-                        S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
-                    } else {
-                        S3Error::internal(e)
-                    }
-                })?;
+            let (size, md5) = if expected_payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+                let raw = axum::body::to_bytes(body, usize::MAX).await
+                    .map_err(|e| S3Error::internal(e))?;
+                let decoded = decode_aws_chunked(&raw)
+                    .map_err(|e| S3Error::internal(e))?;
+                state.storage.put_bytes(&bucket, &key, bytes::Bytes::from(decoded), "UNSIGNED-PAYLOAD").await
+                    .map_err(|e| S3Error::internal(e))?
+            } else {
+                state.storage.put(&bucket, &key, body, &expected_payload_hash).await
+                    .map_err(|e| {
+                        if e.to_string().contains("Checksum mismatch") {
+                            S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
+                        } else {
+                            S3Error::internal(e)
+                        }
+                    })?
+            };
 
             // If Content-MD5 was provided, validate it against the computed MD5
             if let Some(ref provided_md5_b64) = content_md5_header {

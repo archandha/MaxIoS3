@@ -348,4 +348,55 @@ impl SignatureValidator {
 
         Ok(calculated == decoded_sig)
     }
+
+    /// Validates a SigV2 header-based auth (Authorization: AWS access_key:signature)
+    /// String-to-sign: METHOD\nContent-MD5\nContent-Type\nDate\n{amz-headers}\n{resource}
+    pub fn validate_sigv2_header(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &HashMap<String, String>,
+        signature: &str,
+        secret_key: &str,
+    ) -> Result<bool> {
+        use sha1::Sha1;
+        type HmacSha1 = Hmac<Sha1>;
+
+        let content_md5 = headers.get("content-md5").map(|s| s.as_str()).unwrap_or("");
+        let content_type = headers.get("content-type").map(|s| s.as_str()).unwrap_or("");
+        // If x-amz-date is present, the Date line is empty (x-amz-date goes into AmzHeaders)
+        let date = if headers.contains_key("x-amz-date") {
+            ""
+        } else {
+            headers.get("date").map(|s| s.as_str()).unwrap_or("")
+        };
+
+        // Canonicalized AMZ headers: x-amz-* sorted alphabetically, each ending with \n
+        let mut amz_headers: Vec<(String, String)> = headers.iter()
+            .filter(|(k, _)| k.starts_with("x-amz-"))
+            .map(|(k, v)| (k.clone(), v.trim().to_string()))
+            .collect();
+        amz_headers.sort_by(|a, b| a.0.cmp(&b.0));
+        // Each amz header contributes "key:value\n" — note trailing newline
+        let canonicalized_amz = amz_headers.iter()
+            .map(|(k, v)| format!("{}:{}\n", k, v))
+            .collect::<String>();
+
+        // string-to-sign: METHOD\nMD5\nType\nDate\n{amz headers (each with \n)}Resource
+        let string_to_sign = format!("{}\n{}\n{}\n{}\n{}{}", method, content_md5, content_type, date, canonicalized_amz, uri);
+
+        tracing::debug!("SigV2 header string-to-sign: {:?}", string_to_sign);
+
+        let mut hmac = HmacSha1::new_from_slice(secret_key.as_bytes())?;
+        hmac.update(string_to_sign.as_bytes());
+        let calculated = BASE64_STANDARD.encode(hmac.finalize().into_bytes());
+
+        let decoded_sig = percent_decode_str(signature).decode_utf8_lossy().to_string();
+
+        if calculated != decoded_sig {
+            tracing::debug!("SigV2 header mismatch: calculated={}, expected={}", calculated, decoded_sig);
+        }
+
+        Ok(calculated == decoded_sig)
+    }
 }

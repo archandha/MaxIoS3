@@ -282,7 +282,7 @@ pub async fn list_objects(
     super::validate_policy(&state, &params, method.as_str(), &bucket, None).await?;
 
     if !state.bucket_meta.bucket_exists(&bucket).await? {
-        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist.", StatusCode::NOT_FOUND));
+        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist", StatusCode::NOT_FOUND));
     }
 
     let mut objects: Vec<S3ObjectMetadata> = state.bucket_meta.list_objects(&bucket).await?;
@@ -532,7 +532,7 @@ pub async fn delete_bucket(
     super::validate_policy(&state, &params, method.as_str(), &bucket, None).await?;
 
     if !state.bucket_meta.bucket_exists(&bucket).await? {
-        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist.", StatusCode::NOT_FOUND));
+        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist", StatusCode::NOT_FOUND));
     }
 
     state.bucket_meta.delete_bucket(&bucket).await?;
@@ -757,7 +757,7 @@ async fn get_bucket_location(
     super::validate_policy(&state, &params, method.as_str(), &bucket, None).await?;
 
     if !state.bucket_meta.bucket_exists(&bucket).await? {
-        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist.", StatusCode::NOT_FOUND));
+        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist", StatusCode::NOT_FOUND));
     }
 
     let response = GetBucketLocationResponse {

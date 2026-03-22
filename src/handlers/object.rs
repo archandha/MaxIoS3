@@ -63,10 +63,40 @@ pub async fn get_object(
 
     tracing::info!(bucket = %bucket, key = %key, etag = %quoted_etag, "GET Object ETag");
 
+    let last_modified = meta.created_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+    // Support S3 response header overrides via query params
+    let query_map: HashMap<String, String> = all_query.iter().cloned().collect();
+    let content_type = query_map.get("response-content-type")
+        .map(|s| s.as_str())
+        .unwrap_or(&meta.content_type)
+        .to_string();
+
     let mut response_headers = HeaderMap::new();
     response_headers.insert(axum::http::header::ETAG, quoted_etag.parse().unwrap());
-    response_headers.insert(axum::http::header::CONTENT_TYPE, meta.content_type.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()));
+    response_headers.insert(axum::http::header::CONTENT_TYPE, content_type.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()));
     response_headers.insert(axum::http::header::CONTENT_LENGTH, meta.size.to_string().parse().unwrap());
+    response_headers.insert(axum::http::header::LAST_MODIFIED, last_modified.parse().unwrap());
+    if let Some(v) = query_map.get("response-content-disposition") {
+        if let Ok(hv) = v.parse() {
+            response_headers.insert(axum::http::header::CONTENT_DISPOSITION, hv);
+        }
+    }
+    if let Some(v) = query_map.get("response-content-encoding") {
+        if let Ok(hv) = v.parse() {
+            response_headers.insert(axum::http::header::CONTENT_ENCODING, hv);
+        }
+    }
+    if let Some(v) = query_map.get("response-cache-control") {
+        if let Ok(hv) = v.parse() {
+            response_headers.insert(axum::http::header::CACHE_CONTROL, hv);
+        }
+    }
+    if let Some(v) = query_map.get("response-expires") {
+        if let Ok(hv) = v.parse() {
+            response_headers.insert(axum::http::header::EXPIRES, hv);
+        }
+    }
     if let Some(sc) = &meta.storage_class {
         if sc != "STANDARD" {
             if let Ok(v) = sc.parse() {
