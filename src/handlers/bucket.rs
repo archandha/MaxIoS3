@@ -86,7 +86,7 @@ pub struct ListObjectsV1Response {
     pub name: String,
     pub prefix: String,
     pub marker: String,
-    pub max_keys: u32,
+    pub max_keys: i64,
     pub delimiter: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Contents")]
@@ -107,7 +107,7 @@ pub struct ListObjectsV1Response {
 pub struct ListObjectsV2Response {
     pub name: String,
     pub prefix: String,
-    pub max_keys: u32,
+    pub max_keys: i64,
     pub delimiter: Option<String>,
     pub is_truncated: bool,
     pub key_count: usize,
@@ -211,6 +211,32 @@ pub async fn list_objects(
     if bucket == "minio" && all_query.iter().any(|(k, _)| k == "metrics") {
         return get_metrics().await;
     }
+
+    // GET /bucket?lifecycle
+    if all_query.iter().any(|(k, _)| k == "lifecycle") {
+        return get_bucket_lifecycle(method, uri, bucket, all_query, state, headers).await;
+    }
+
+    // GET /bucket?<other unsupported sub-resources>
+    const UNSUPPORTED_GET_SUB: &[&str] = &[
+        "versioning", "tagging", "cors", "acl",
+        "website", "logging", "replication", "notification",
+        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
+        "inventory", "metrics", "ownershipControls", "publicAccessBlock",
+    ];
+    if all_query.iter().any(|(k, _)| UNSUPPORTED_GET_SUB.contains(&k.as_str())) {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        tracing::info!(bucket = %bucket, "GET sub-resource (stub 404)");
+        return Err(S3Error::new(
+            S3ErrorCode::NoSuchLifecycleConfiguration,
+            "The lifecycle configuration does not exist.",
+            StatusCode::NOT_FOUND,
+        ));
+    }
+
     tracing::info!(bucket = %bucket, "List Objects");
 
     let (params, _) = validate_auth(
@@ -256,6 +282,18 @@ pub async fn list_objects(
             }
         }
         objects = filtered_objects;
+    }
+
+    // Parse max-keys: negative means "no limit" (pass-through the value, return all)
+    let max_keys: i64 = all_query.iter().find(|(k, _)| k == "max-keys")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(1000);
+    let effective_limit = if max_keys < 0 { usize::MAX } else { max_keys as usize };
+
+    // Apply max-keys limit
+    let is_truncated = objects.len() > effective_limit;
+    if is_truncated {
+        objects.truncate(effective_limit);
     }
 
     let key_count = objects.len() + common_prefixes.len();
@@ -311,9 +349,9 @@ pub async fn list_objects(
         let response = ListObjectsV2Response {
             name: bucket,
             prefix: maybe_encode(prefix, use_url_encoding),
-            max_keys: all_query.iter().find(|(k, _)| k == "max-keys").and_then(|(_, v)| v.parse().ok()).unwrap_or(1000),
+            max_keys,
             delimiter: delimiter.map(|d| maybe_encode(d, use_url_encoding)),
-            is_truncated: false,
+            is_truncated,
             key_count,
             contents,
             common_prefixes,
@@ -328,9 +366,9 @@ pub async fn list_objects(
             name: bucket,
             prefix: maybe_encode(prefix, use_url_encoding),
             marker: all_query.iter().find(|(k, _)| k == "marker").map(|(_, v)| maybe_encode(v.clone(), use_url_encoding)).unwrap_or_default(),
-            max_keys: all_query.iter().find(|(k, _)| k == "max-keys").and_then(|(_, v)| v.parse().ok()).unwrap_or(1000),
+            max_keys,
             delimiter: delimiter.map(|d| maybe_encode(d, use_url_encoding)),
-            is_truncated: false,
+            is_truncated,
             contents,
             common_prefixes,
             next_marker: None,
@@ -359,6 +397,28 @@ pub async fn create_bucket(
     if all_query.iter().any(|(k, _)| k == "policy") {
         return put_bucket_policy(method, uri, bucket, all_query, state, headers, body).await;
     }
+
+    // PUT /bucket?lifecycle
+    if all_query.iter().any(|(k, _)| k == "lifecycle") {
+        return put_bucket_lifecycle(method, uri, bucket, all_query, state, headers, body).await;
+    }
+
+    // PUT /bucket?<other unsupported sub-resources>: accept and ignore
+    const UNSUPPORTED_PUT_SUB: &[&str] = &[
+        "versioning", "tagging", "cors", "acl",
+        "website", "logging", "replication", "notification",
+        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
+        "inventory", "metrics", "ownershipControls", "publicAccessBlock",
+    ];
+    if all_query.iter().any(|(k, _)| UNSUPPORTED_PUT_SUB.contains(&k.as_str())) {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        tracing::info!(bucket = %bucket, "PUT sub-resource (stub 200)");
+        return Ok(StatusCode::OK.into_response());
+    }
+
     tracing::info!(bucket = %bucket, "Create Bucket");
 
     let (_params, _) = validate_auth(
@@ -392,6 +452,34 @@ pub async fn delete_bucket(
     if all_query.iter().any(|(k, _)| k == "policy") {
         return delete_bucket_policy(method, uri, bucket, all_query, state, headers).await;
     }
+
+    // DELETE /bucket?lifecycle
+    if all_query.iter().any(|(k, _)| k == "lifecycle") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        state.bucket_meta.delete_bucket_lifecycle(&bucket).await?;
+        tracing::info!(bucket = %bucket, "Delete lifecycle");
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    // DELETE /bucket?<other sub-resources> — just ack with 204
+    const SUB_RESOURCES: &[&str] = &[
+        "versioning", "tagging", "cors", "acl",
+        "website", "logging", "replication", "notification",
+        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
+        "inventoryId", "metrics", "ownershipControls", "publicAccessBlock",
+    ];
+    if all_query.iter().any(|(k, _)| SUB_RESOURCES.contains(&k.as_str())) {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        tracing::info!(bucket = %bucket, "Delete sub-resource (stub 204)");
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
     tracing::info!(bucket = %bucket, "Delete Bucket");
 
     let (params, _) = validate_auth(
@@ -480,19 +568,18 @@ async fn presigned_post(
     let data = file_data.ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument, "Missing file in form", StatusCode::BAD_REQUEST))?;
 
     use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(&data);
-    let checksum = hex::encode(hasher.finalize());
+    let sha256 = hex::encode(sha2::Sha256::digest(&data));
 
-    state.storage.put_bytes(&bucket, &key, data.clone(), &checksum).await?;
+    let (size, md5) = state.storage.put_bytes(&bucket, &key, data, &sha256).await?;
 
     state.bucket_meta.save_object(S3ObjectMetadata {
         bucket: bucket.clone(),
         key: key.clone(),
-        size: data.len() as u64,
+        size,
         content_type: content_type_val,
-        checksum,
+        checksum: md5,
         metadata: None,
+        storage_class: None,
         created_at: chrono::Utc::now(),
     }).await?;
 
@@ -669,6 +756,59 @@ async fn delete_bucket_policy(
     state.bucket_meta.delete_bucket_policy(&bucket).await?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn get_bucket_lifecycle(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    bucket: String,
+    all_query: Vec<(String, String)>,
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, S3Error> {
+    let (_params, _) = validate_auth(
+        &state, method.as_str(), uri.path(), &all_query, &headers,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ).await?;
+
+    match state.bucket_meta.get_bucket_lifecycle(&bucket).await? {
+        Some(xml) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            xml,
+        ).into_response()),
+        None => Err(S3Error::new(
+            S3ErrorCode::NoSuchLifecycleConfiguration,
+            "The lifecycle configuration does not exist.",
+            StatusCode::NOT_FOUND,
+        )),
+    }
+}
+
+async fn put_bucket_lifecycle(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    bucket: String,
+    all_query: Vec<(String, String)>,
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<axum::response::Response, S3Error> {
+    let body_bytes = axum::body::to_bytes(body, 1024 * 1024).await
+        .map_err(|e| S3Error::internal(e))?;
+
+    use sha2::Digest;
+    let payload_hash = hex::encode(sha2::Sha256::new().chain_update(&body_bytes).finalize());
+
+    let (_params, _) = validate_auth(
+        &state, method.as_str(), uri.path(), &all_query, &headers, &payload_hash,
+    ).await?;
+
+    let xml = String::from_utf8(body_bytes.to_vec())
+        .map_err(|e| S3Error::internal(e))?;
+    state.bucket_meta.set_bucket_lifecycle(&bucket, xml).await?;
+    tracing::info!(bucket = %bucket, "PUT lifecycle");
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn get_metrics() -> Result<axum::response::Response, S3Error> {

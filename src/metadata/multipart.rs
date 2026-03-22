@@ -22,11 +22,12 @@ pub struct MultipartUpload {
     pub parts: Vec<MultipartPart>,
     pub metadata: Option<String>,
     pub content_type: Option<String>,
+    pub storage_class: Option<String>,
 }
 
 #[async_trait]
 pub trait MultipartMetadataEngine: Send + Sync {
-    async fn initiate_multipart(&self, bucket: &str, key: &str, metadata: Option<String>, content_type: Option<String>) -> Result<String>;
+    async fn initiate_multipart(&self, bucket: &str, key: &str, metadata: Option<String>, content_type: Option<String>, storage_class: Option<String>) -> Result<String>;
     async fn save_part(&self, upload_id: &str, part: MultipartPart) -> Result<()>;
     async fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartUpload>>;
     async fn complete_multipart(&self, upload_id: &str) -> Result<()>;

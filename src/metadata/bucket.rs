@@ -21,7 +21,8 @@ pub struct S3ObjectMetadata {
     pub size: u64,
     pub content_type: String,
     pub checksum: String,
-    pub metadata: Option<String>, // Store metadata as JSON string
+    pub metadata: Option<String>,
+    pub storage_class: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -62,4 +63,9 @@ pub trait BucketMetadataEngine: Send + Sync {
     async fn get_bucket_policy(&self, bucket: &str) -> Result<Option<BucketPolicy>>;
     async fn set_bucket_policy(&self, bucket: &str, policy: BucketPolicy) -> Result<()>;
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<()>;
+
+    // Bucket Lifecycle methods (stored as raw XML)
+    async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>>;
+    async fn set_bucket_lifecycle(&self, bucket: &str, lifecycle_xml: String) -> Result<()>;
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()>;
 }

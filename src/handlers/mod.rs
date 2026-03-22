@@ -20,6 +20,11 @@ pub async fn validate_auth(
 ) -> Result<(SigV4Params, String), S3Error> {
     let query_map: HashMap<String, String> = query.iter().cloned().collect();
 
+    // SigV2 presigned URL: AWSAccessKeyId + Signature + Expires
+    if query_map.contains_key("AWSAccessKeyId") {
+        return validate_auth_sigv2(state, method, uri, &query_map).await;
+    }
+
     let params = if let Some(auth_header) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
         SigV4Params::parse(auth_header)
             .map_err(|e| S3Error::new(S3ErrorCode::AccessDenied, format!("Invalid Authorization header: {}", e), StatusCode::FORBIDDEN))?
@@ -67,6 +72,44 @@ pub async fn validate_auth(
     }
 
     Ok((params, auth_payload_hash.to_string()))
+}
+
+async fn validate_auth_sigv2(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    query_map: &HashMap<String, String>,
+) -> Result<(SigV4Params, String), S3Error> {
+    let access_key = query_map.get("AWSAccessKeyId")
+        .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Missing AWSAccessKeyId", StatusCode::FORBIDDEN))?;
+    let signature = query_map.get("Signature")
+        .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Missing Signature", StatusCode::FORBIDDEN))?;
+    let expires = query_map.get("Expires")
+        .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Missing Expires", StatusCode::FORBIDDEN))?;
+
+    let user: S3User = state.user_meta.get_user(access_key).await?
+        .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Invalid Access Key", StatusCode::FORBIDDEN))?;
+
+    if !user.is_active {
+        return Err(S3Error::new(S3ErrorCode::AccessDenied, "User account is inactive", StatusCode::FORBIDDEN));
+    }
+
+    let is_valid = state.auth.validate_sigv2_presigned(method, uri, expires, signature, &user.secret_key)
+        .map_err(|e| S3Error::internal(e))?;
+
+    if !is_valid {
+        return Err(S3Error::new(S3ErrorCode::SignatureDoesNotMatch, "SigV2 signature mismatch or expired", StatusCode::FORBIDDEN));
+    }
+
+    Ok((SigV4Params {
+        access_key: access_key.clone(),
+        credential_scope: String::new(),
+        signed_headers: vec![],
+        signature: signature.clone(),
+        is_presigned: true,
+        expires: expires.parse::<u64>().ok(),
+        amz_date: None,
+    }, "UNSIGNED-PAYLOAD".to_string()))
 }
 
 pub async fn validate_policy(

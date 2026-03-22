@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use tokio_util::io::ReaderStream;
 use axum::body::Body;
 use sha2::{Digest, Sha256};
+use md5::Md5;
 use tokio::io::AsyncWriteExt;
 
 /// The StorageEngine trait defines how data is physically stored.
@@ -20,8 +21,9 @@ pub trait StorageEngine: Send + Sync {
     /// Deletes a bucket and all its contents.
     async fn delete_bucket(&self, name: &str) -> Result<()>;
 
-    /// Streams data into a new object, verifying checksum on the fly
-    async fn put(&self, bucket: &str, key: &str, body: Body, expected_checksum: &str) -> Result<u64>;
+    /// Streams data into a new object, verifying SHA256 checksum on the fly.
+    /// Returns (size, md5_hex) — md5_hex is used as the S3 ETag.
+    async fn put(&self, bucket: &str, key: &str, body: Body, expected_checksum: &str) -> Result<(u64, String)>;
 
     /// Returns a stream to read the object efficiently (Streaming).
     async fn get(&self, bucket: &str, key: &str) -> Result<Body>;
@@ -32,8 +34,9 @@ pub trait StorageEngine: Send + Sync {
     /// Deletes an object.
     async fn delete(&self, bucket: &str, key: &str) -> Result<()>;
 
-    /// Streams data into a multipart part, verifying checksum on the fly
-    async fn put_part(&self, upload_id: &str, part_number: u32, body: Body, expected_checksum: &str) -> Result<u64>;
+    /// Streams data into a multipart part, verifying SHA256 checksum on the fly.
+    /// Returns (size, md5_hex) — md5_hex is stored as the part ETag.
+    async fn put_part(&self, upload_id: &str, part_number: u32, body: Body, expected_checksum: &str) -> Result<(u64, String)>;
 
     /// Assembles all parts of a multipart upload into a final object.
     async fn assemble(&self, upload_id: &str, bucket: &str, key: &str, part_numbers: Vec<u32>) -> Result<u64>;
@@ -41,8 +44,8 @@ pub trait StorageEngine: Send + Sync {
     /// Copies an object from source to destination.
     async fn copy(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> Result<()>;
 
-    /// Writes bytes directly to an object.
-    async fn put_bytes(&self, bucket: &str, key: &str, data: bytes::Bytes, expected_checksum: &str) -> Result<u64>;
+    /// Writes bytes directly to an object. Returns (size, md5_hex).
+    async fn put_bytes(&self, bucket: &str, key: &str, data: bytes::Bytes, expected_checksum: &str) -> Result<(u64, String)>;
 
     /// Cleans up temporary files after a multipart upload.
     async fn cleanup_multipart(&self, upload_id: &str) -> Result<()>;
@@ -93,36 +96,37 @@ impl StorageEngine for FileSystemStorage {
         Ok(())
     }
 
-    async fn put(&self, bucket: &str, key: &str, body: Body, expected_checksum: &str) -> Result<u64> {
+    async fn put(&self, bucket: &str, key: &str, body: Body, expected_checksum: &str) -> Result<(u64, String)> {
         let file_path = self.get_path(bucket, key);
 
-        // Ensure parent directory exists
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
         let mut file = tokio::fs::File::create(&file_path).await?;
         let mut stream = body.into_data_stream();
-        let mut total_size = 0;
-        let mut hasher = Sha256::new();
+        let mut total_size = 0u64;
+        let mut sha256 = Sha256::new();
+        let mut md5 = Md5::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| anyhow!("Stream error: {}", e))?;
             file.write_all(&chunk).await?;
-            hasher.update(&chunk);
+            sha256.update(&chunk);
+            md5.update(&chunk);
             total_size += chunk.len() as u64;
         }
 
-        let calculated_checksum = hex::encode(hasher.finalize());
+        let calculated_sha256 = hex::encode(sha256.finalize());
+        let md5_hex = hex::encode(md5.finalize());
 
-        // Skip verification if the client sent "UNSIGNED-PAYLOAD"
-        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_checksum != expected_checksum {
+        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_sha256 != expected_checksum {
             drop(file);
             tokio::fs::remove_file(&file_path).await?;
-            return Err(anyhow!("Checksum mismatch: expected {}, got {}", expected_checksum, calculated_checksum));
+            return Err(anyhow!("Checksum mismatch: expected {}, got {}", expected_checksum, calculated_sha256));
         }
 
-        Ok(total_size)
+        Ok((total_size, md5_hex))
     }
 
     async fn get(&self, bucket: &str, key: &str) -> Result<Body> {
@@ -145,32 +149,35 @@ impl StorageEngine for FileSystemStorage {
         Ok(())
     }
 
-    async fn put_part(&self, upload_id: &str, part_number: u32, body: Body, expected_checksum: &str) -> Result<u64> {
+    async fn put_part(&self, upload_id: &str, part_number: u32, body: Body, expected_checksum: &str) -> Result<(u64, String)> {
         let upload_path = self.temp.join(upload_id);
         tokio::fs::create_dir_all(&upload_path).await?;
         let part_path = upload_path.join(part_number.to_string());
 
         let mut file = tokio::fs::File::create(&part_path).await?;
         let mut stream = body.into_data_stream();
-        let mut total_size = 0;
-        let mut hasher = Sha256::new();
+        let mut total_size = 0u64;
+        let mut sha256 = Sha256::new();
+        let mut md5 = Md5::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| anyhow!("Stream error: {}", e))?;
             file.write_all(&chunk).await?;
-            hasher.update(&chunk);
+            sha256.update(&chunk);
+            md5.update(&chunk);
             total_size += chunk.len() as u64;
         }
 
-        let calculated_checksum = hex::encode(hasher.finalize());
+        let calculated_sha256 = hex::encode(sha256.finalize());
+        let md5_hex = hex::encode(md5.finalize());
 
-        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_checksum != expected_checksum {
+        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_sha256 != expected_checksum {
             drop(file);
             tokio::fs::remove_file(&part_path).await?;
-            return Err(anyhow!("Checksum mismatch for part {}: expected {}, got {}", part_number, expected_checksum, calculated_checksum));
+            return Err(anyhow!("Checksum mismatch for part {}: expected {}, got {}", part_number, expected_checksum, calculated_sha256));
         }
 
-        Ok(total_size)
+        Ok((total_size, md5_hex))
     }
 
     async fn assemble(&self, upload_id: &str, bucket: &str, key: &str, part_numbers: Vec<u32>) -> Result<u64> {
@@ -213,19 +220,20 @@ impl StorageEngine for FileSystemStorage {
         Ok(())
     }
 
-    async fn put_bytes(&self, bucket: &str, key: &str, data: bytes::Bytes, expected_checksum: &str) -> Result<u64> {
+    async fn put_bytes(&self, bucket: &str, key: &str, data: bytes::Bytes, expected_checksum: &str) -> Result<(u64, String)> {
         let file_path = self.get_path(bucket, key);
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let calculated_checksum = hex::encode(Sha256::digest(&data));
-        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_checksum != expected_checksum {
-            return Err(anyhow!("Checksum mismatch: expected {}, got {}", expected_checksum, calculated_checksum));
+        let sha256 = hex::encode(Sha256::digest(&data));
+        if expected_checksum != "UNSIGNED-PAYLOAD" && sha256 != expected_checksum {
+            return Err(anyhow!("Checksum mismatch: expected {}, got {}", expected_checksum, sha256));
         }
 
+        let md5_hex = hex::encode(Md5::digest(&data));
         tokio::fs::write(file_path, &data).await?;
-        Ok(data.len() as u64)
+        Ok((data.len() as u64, md5_hex))
     }
 
     async fn cleanup_multipart(&self, upload_id: &str) -> Result<()> {

@@ -39,13 +39,15 @@ impl SqliteMetadata {
                 content_type TEXT,
                 checksum TEXT,
                 metadata TEXT,
+                storage_class TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (bucket, key)
             )"
         ).execute(&pool).await?;
 
-        // Ensure metadata column exists (for existing databases)
+        // Ensure columns exist (for existing databases)
         let _ = sqlx::query("ALTER TABLE objects ADD COLUMN metadata TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN storage_class TEXT").execute(&pool).await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS multipart_uploads (
@@ -54,13 +56,14 @@ impl SqliteMetadata {
                 key TEXT,
                 metadata TEXT,
                 content_type TEXT,
+                storage_class TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )"
         ).execute(&pool).await?;
 
-        // Ensure metadata/content_type columns exist (for existing databases)
         let _ = sqlx::query("ALTER TABLE multipart_uploads ADD COLUMN metadata TEXT").execute(&pool).await;
         let _ = sqlx::query("ALTER TABLE multipart_uploads ADD COLUMN content_type TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE multipart_uploads ADD COLUMN storage_class TEXT").execute(&pool).await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS multipart_parts (
@@ -86,6 +89,14 @@ impl SqliteMetadata {
             "CREATE TABLE IF NOT EXISTS bucket_policies (
                 bucket TEXT PRIMARY KEY,
                 policy TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )"
+        ).execute(&pool).await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bucket_lifecycle (
+                bucket TEXT PRIMARY KEY,
+                lifecycle TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )"
         ).execute(&pool).await?;
@@ -130,8 +141,8 @@ impl BucketMetadataEngine for SqliteMetadata {
 
     async fn save_object(&self, meta: S3ObjectMetadata) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO objects (bucket, key, size, content_type, checksum, metadata)
-             VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR REPLACE INTO objects (bucket, key, size, content_type, checksum, metadata, storage_class)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&meta.bucket)
         .bind(&meta.key)
@@ -139,6 +150,7 @@ impl BucketMetadataEngine for SqliteMetadata {
         .bind(&meta.content_type)
         .bind(&meta.checksum)
         .bind(&meta.metadata)
+        .bind(&meta.storage_class)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -146,7 +158,7 @@ impl BucketMetadataEngine for SqliteMetadata {
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<S3ObjectMetadata>> {
         let row = sqlx::query_as::<_, S3ObjectMetadata>(
-            "SELECT bucket, key, size, content_type, checksum, metadata, created_at FROM objects WHERE bucket = ? AND key = ?"
+            "SELECT bucket, key, size, content_type, checksum, metadata, storage_class, created_at FROM objects WHERE bucket = ? AND key = ?"
         )
         .bind(bucket)
         .bind(key)
@@ -157,7 +169,7 @@ impl BucketMetadataEngine for SqliteMetadata {
 
     async fn list_objects(&self, bucket: &str) -> Result<Vec<S3ObjectMetadata>> {
         let rows = sqlx::query_as::<_, S3ObjectMetadata>(
-            "SELECT bucket, key, size, content_type, checksum, metadata, created_at FROM objects WHERE bucket = ?"
+            "SELECT bucket, key, size, content_type, checksum, metadata, storage_class, created_at FROM objects WHERE bucket = ?"
         )
         .bind(bucket)
         .fetch_all(&self.pool)
@@ -207,20 +219,46 @@ impl BucketMetadataEngine for SqliteMetadata {
             .await?;
         Ok(())
     }
+
+    async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT lifecycle FROM bucket_lifecycle WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(xml,)| xml))
+    }
+
+    async fn set_bucket_lifecycle(&self, bucket: &str, lifecycle_xml: String) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO bucket_lifecycle (bucket, lifecycle) VALUES (?, ?)")
+            .bind(bucket)
+            .bind(lifecycle_xml)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()> {
+        sqlx::query("DELETE FROM bucket_lifecycle WHERE bucket = ?")
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl MultipartMetadataEngine for SqliteMetadata {
-    async fn initiate_multipart(&self, bucket: &str, key: &str, metadata: Option<String>, content_type: Option<String>) -> Result<String> {
+    async fn initiate_multipart(&self, bucket: &str, key: &str, metadata: Option<String>, content_type: Option<String>, storage_class: Option<String>) -> Result<String> {
         let upload_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO multipart_uploads (upload_id, bucket, key, metadata, content_type) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO multipart_uploads (upload_id, bucket, key, metadata, content_type, storage_class) VALUES (?, ?, ?, ?, ?, ?)"
         )
         .bind(&upload_id)
         .bind(bucket)
         .bind(key)
         .bind(&metadata)
         .bind(&content_type)
+        .bind(&storage_class)
         .execute(&self.pool)
         .await?;
         Ok(upload_id)
@@ -242,7 +280,7 @@ impl MultipartMetadataEngine for SqliteMetadata {
 
     async fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
         let upload_row = sqlx::query(
-            "SELECT upload_id, bucket, key, metadata, content_type FROM multipart_uploads WHERE upload_id = ?"
+            "SELECT upload_id, bucket, key, metadata, content_type, storage_class FROM multipart_uploads WHERE upload_id = ?"
         )
         .bind(upload_id)
         .fetch_optional(&self.pool)
@@ -263,6 +301,7 @@ impl MultipartMetadataEngine for SqliteMetadata {
                 parts,
                 metadata: row.get("metadata"),
                 content_type: row.get("content_type"),
+                storage_class: row.get("storage_class"),
             }))
         } else {
             Ok(None)

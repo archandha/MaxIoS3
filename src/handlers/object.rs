@@ -67,6 +67,16 @@ pub async fn get_object(
     response_headers.insert(axum::http::header::ETAG, quoted_etag.parse().unwrap());
     response_headers.insert(axum::http::header::CONTENT_TYPE, meta.content_type.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()));
     response_headers.insert(axum::http::header::CONTENT_LENGTH, meta.size.to_string().parse().unwrap());
+    if let Some(sc) = &meta.storage_class {
+        if sc != "STANDARD" {
+            if let Ok(v) = sc.parse() {
+                response_headers.insert(
+                    axum::http::header::HeaderName::from_static("x-amz-storage-class"),
+                    v,
+                );
+            }
+        }
+    }
 
     if let Some(metadata_json) = meta.metadata {
         if let Ok(metadata) = serde_json::from_str::<HashMap<String, String>>(&metadata_json) {

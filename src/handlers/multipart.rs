@@ -12,7 +12,6 @@ use axum::{
     response::IntoResponse,
 };
 use crate::{AppState, S3Error, S3ErrorCode, MultipartPart, S3ObjectMetadata, MultipartUpload};
-use sha2::Digest;
 use super::validate_auth;
 
 #[derive(serde::Serialize)]
@@ -60,7 +59,7 @@ pub async fn put_handler(
 
     if let (Some(upload_id), Some(part_number)) = (upload_id, part_number) {
         tracing::info!(upload_id = %upload_id, part = part_number, "Upload Part (Streaming)");
-        let size: u64 = state.storage.put_part(upload_id, part_number, body, &expected_payload_hash).await
+        let (size, md5) = state.storage.put_part(upload_id, part_number, body, &expected_payload_hash).await
             .map_err(|e| {
                 if e.to_string().contains("Checksum mismatch") {
                     S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
@@ -72,11 +71,11 @@ pub async fn put_handler(
         state.multipart_meta.save_part(upload_id, MultipartPart {
             part_number,
             size,
-            checksum: expected_payload_hash.to_string(),
+            checksum: md5.clone(),
         }).await?;
         Ok((
             StatusCode::OK,
-            [(axum::http::header::ETAG, format!("\"{}\"", expected_payload_hash))],
+            [(axum::http::header::ETAG, format!("\"{}\"", md5))],
         ).into_response())
     } else if let Some(copy_source) = headers.get("x-amz-copy-source").and_then(|h| h.to_str().ok()) {
         tracing::info!(bucket = %bucket, key = %key, source = %copy_source, "Copy Object");
@@ -95,6 +94,12 @@ pub async fn put_handler(
 
         state.storage.copy(src_bucket, &src_key, &bucket, &key).await?;
 
+        // x-amz-storage-class on the copy request overrides the source; absent means inherit
+        let storage_class = headers.get("x-amz-storage-class")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .or_else(|| src_meta.storage_class.clone());
+
         let now = chrono::Utc::now();
         state.bucket_meta.save_object(S3ObjectMetadata {
             bucket: bucket.clone(),
@@ -103,6 +108,7 @@ pub async fn put_handler(
             content_type: src_meta.content_type,
             checksum: src_meta.checksum.clone(),
             metadata: src_meta.metadata.clone(),
+            storage_class,
             created_at: now,
         }).await?;
 
@@ -167,17 +173,16 @@ pub async fn put_handler(
             .map_err(|e| S3Error::internal(e))?;
 
             for (entry_key, data_bytes) in extracted {
-                let size = data_bytes.len() as u64;
-                let checksum = hex::encode(sha2::Sha256::digest(&data_bytes));
-                state.storage.put_bytes(&bucket, &entry_key, data_bytes, "UNSIGNED-PAYLOAD").await
+                let (size, md5) = state.storage.put_bytes(&bucket, &entry_key, data_bytes, "UNSIGNED-PAYLOAD").await
                     .map_err(|e| S3Error::internal(e))?;
                 state.bucket_meta.save_object(S3ObjectMetadata {
                     bucket: bucket.clone(),
                     key: entry_key,
                     size,
                     content_type: "application/octet-stream".to_string(),
-                    checksum,
+                    checksum: md5,
                     metadata: None,
+                    storage_class: None,
                     created_at: chrono::Utc::now(),
                 }).await?;
             }
@@ -185,7 +190,7 @@ pub async fn put_handler(
             Ok(StatusCode::OK.into_response())
         } else {
             tracing::info!(bucket = %bucket, key = %key, "PUT Object (Streaming)");
-            let size: u64 = state.storage.put(&bucket, &key, body, &expected_payload_hash).await
+            let (size, md5) = state.storage.put(&bucket, &key, body, &expected_payload_hash).await
                 .map_err(|e| {
                     if e.to_string().contains("Checksum mismatch") {
                         S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
@@ -200,13 +205,18 @@ pub async fn put_handler(
                 .collect();
             let metadata_json = serde_json::to_string(&metadata).ok();
 
+            let storage_class = headers.get("x-amz-storage-class")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
+
             state.bucket_meta.save_object(S3ObjectMetadata {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 size,
                 content_type: headers.get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("application/octet-stream").to_string(),
-                checksum: expected_payload_hash.to_string(),
+                checksum: md5,
                 metadata: metadata_json,
+                storage_class,
                 created_at: chrono::Utc::now(),
             }).await?;
 
@@ -318,7 +328,8 @@ pub async fn post_handler(
             .collect();
         let metadata_json = if metadata.is_empty() { None } else { serde_json::to_string(&metadata).ok() };
         let content_type = headers.get("content-type").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
-        let upload_id: String = state.multipart_meta.initiate_multipart(&bucket, &key, metadata_json, content_type).await?;
+        let storage_class = headers.get("x-amz-storage-class").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+        let upload_id: String = state.multipart_meta.initiate_multipart(&bucket, &key, metadata_json, content_type, storage_class).await?;
         let response = InitiateMultipartResponse {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -342,14 +353,19 @@ pub async fn post_handler(
         tracing::info!(upload_id = %upload_id, parts = ?part_numbers, "Assembling parts");
         let total_size: u64 = state.storage.assemble(upload_id, &bucket, &key, part_numbers).await?;
 
-        // Calculate a combined ETag. For 0-byte objects, use a specific ETag.
-        let etag = if total_size == 0 {
-            "d41d8cd98f00b204e9800998ecf8427e".to_string()
-        } else {
-            // For multipart uploads, S3 ETags are typically <md5>-<part_count>
-            // Use a consistent hash based on part checksums if possible,
-            // but for now, ensure the format is correct.
-            format!("{}--{}", uuid::Uuid::new_v4().simple(), upload.parts.len())
+        // S3 multipart ETag = MD5(concat of each part's MD5 bytes) + "-" + part_count
+        let etag = {
+            use md5::{Md5, Digest as Md5Digest};
+            let mut sorted_parts = upload.parts.clone();
+            sorted_parts.sort_by_key(|p| p.part_number);
+            let mut combined = Vec::with_capacity(sorted_parts.len() * 16);
+            for part in &sorted_parts {
+                if let Ok(bytes) = hex::decode(&part.checksum) {
+                    combined.extend_from_slice(&bytes);
+                }
+            }
+            let md5_hex = hex::encode(Md5::digest(&combined));
+            format!("{}-{}", md5_hex, sorted_parts.len())
         };
 
         tracing::info!(upload_id = %upload_id, total_size = total_size, etag = %etag, "Completing Multipart Upload ETag");
@@ -361,6 +377,7 @@ pub async fn post_handler(
             content_type: upload.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
             checksum: etag.clone(),
             metadata: upload.metadata,
+            storage_class: upload.storage_class,
             created_at: chrono::Utc::now(),
         }).await?;
 
@@ -373,6 +390,7 @@ pub async fn post_handler(
         struct CompleteMultipartResponse {
             bucket: String,
             key: String,
+            #[serde(rename = "ETag")]
             etag: String,
         }
 

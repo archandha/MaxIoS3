@@ -28,6 +28,7 @@ pub enum S3ErrorCode {
     EntityTooSmall,
     EntityTooLarge,
     NoSuchBucketPolicy,
+    NoSuchLifecycleConfiguration,
     MalformedPolicy,
     XAmzContentSHA256Mismatch,
     MethodNotAllowed,

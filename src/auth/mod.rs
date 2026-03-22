@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use percent_encoding::percent_decode_str;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 pub mod policy;
 
@@ -307,5 +308,44 @@ impl SignatureValidator {
         let mut hmac = HmacSha256::new_from_slice(key)?;
         hmac.update(data);
         Ok(hmac.finalize().into_bytes().to_vec())
+    }
+
+    /// Validates a SigV2 presigned URL (legacy AWS Signature Version 2)
+    /// String-to-sign: METHOD\n\n\nExpires\n/path
+    pub fn validate_sigv2_presigned(
+        &self,
+        method: &str,
+        uri: &str,
+        expires: &str,
+        signature: &str,
+        secret_key: &str,
+    ) -> Result<bool> {
+        use sha1::Sha1;
+        type HmacSha1 = Hmac<Sha1>;
+
+        // SigV2 Expires is an absolute Unix timestamp
+        let expires_ts: i64 = expires.parse().map_err(|_| anyhow!("Invalid Expires timestamp"))?;
+        let now = chrono::Utc::now().timestamp();
+        if now > expires_ts {
+            tracing::debug!("SigV2 presigned URL expired: now={} > expires={}", now, expires_ts);
+            return Ok(false);
+        }
+
+        // String-to-sign: METHOD\n\n\nExpires\n/path
+        let string_to_sign = format!("{}\n\n\n{}\n{}", method, expires, uri);
+        tracing::debug!("SigV2 string-to-sign: {:?}", string_to_sign);
+
+        let mut hmac = HmacSha1::new_from_slice(secret_key.as_bytes())?;
+        hmac.update(string_to_sign.as_bytes());
+        let calculated = BASE64_STANDARD.encode(hmac.finalize().into_bytes());
+
+        // The provided signature may be URL-encoded (e.g., '+' → '%2B', '=' → '%3D')
+        let decoded_sig = percent_decode_str(signature).decode_utf8_lossy().to_string();
+
+        if calculated != decoded_sig {
+            tracing::debug!("SigV2 mismatch: calculated={}, expected={}", calculated, decoded_sig);
+        }
+
+        Ok(calculated == decoded_sig)
     }
 }
