@@ -31,3 +31,5 @@ quick-xml = { version = "0.37", features = ["serde", "serialize"] }
 multer = "3.1"
 dotenvy = "0.15"
 percent-encoding = "2.3"
+tar = "0.4"
+flate2 = "1.0"

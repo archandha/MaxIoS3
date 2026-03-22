@@ -537,17 +537,15 @@ async fn delete_objects(
         deleted.push(DeletedEntry { key: obj.key });
     }
 
-    if req.quiet.unwrap_or(false) {
-        Ok(StatusCode::NO_CONTENT.into_response())
-    } else {
-        let response = DeleteObjectsResponse { deleted };
-        let xml = to_string(&response).map_err(|e| S3Error::internal(e))?;
-        Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/xml")],
-            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml)
-        ).into_response())
-    }
+    // quiet=true omits successfully deleted entries but still requires a 200 + XML body
+    let response_deleted = if req.quiet.unwrap_or(false) { vec![] } else { deleted };
+    let response = DeleteObjectsResponse { deleted: response_deleted };
+    let xml = to_string(&response).map_err(|e| S3Error::internal(e))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/xml")],
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml)
+    ).into_response())
 }
 
 async fn get_bucket_policy(

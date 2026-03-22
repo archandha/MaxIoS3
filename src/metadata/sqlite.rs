@@ -52,9 +52,15 @@ impl SqliteMetadata {
                 upload_id TEXT PRIMARY KEY,
                 bucket TEXT,
                 key TEXT,
+                metadata TEXT,
+                content_type TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )"
         ).execute(&pool).await?;
+
+        // Ensure metadata/content_type columns exist (for existing databases)
+        let _ = sqlx::query("ALTER TABLE multipart_uploads ADD COLUMN metadata TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE multipart_uploads ADD COLUMN content_type TEXT").execute(&pool).await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS multipart_parts (
@@ -205,14 +211,16 @@ impl BucketMetadataEngine for SqliteMetadata {
 
 #[async_trait]
 impl MultipartMetadataEngine for SqliteMetadata {
-    async fn initiate_multipart(&self, bucket: &str, key: &str) -> Result<String> {
+    async fn initiate_multipart(&self, bucket: &str, key: &str, metadata: Option<String>, content_type: Option<String>) -> Result<String> {
         let upload_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO multipart_uploads (upload_id, bucket, key) VALUES (?, ?, ?)"
+            "INSERT INTO multipart_uploads (upload_id, bucket, key, metadata, content_type) VALUES (?, ?, ?, ?, ?)"
         )
         .bind(&upload_id)
         .bind(bucket)
         .bind(key)
+        .bind(&metadata)
+        .bind(&content_type)
         .execute(&self.pool)
         .await?;
         Ok(upload_id)
@@ -234,7 +242,7 @@ impl MultipartMetadataEngine for SqliteMetadata {
 
     async fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
         let upload_row = sqlx::query(
-            "SELECT upload_id, bucket, key FROM multipart_uploads WHERE upload_id = ?"
+            "SELECT upload_id, bucket, key, metadata, content_type FROM multipart_uploads WHERE upload_id = ?"
         )
         .bind(upload_id)
         .fetch_optional(&self.pool)
@@ -253,6 +261,8 @@ impl MultipartMetadataEngine for SqliteMetadata {
                 bucket: row.get("bucket"),
                 key: row.get("key"),
                 parts,
+                metadata: row.get("metadata"),
+                content_type: row.get("content_type"),
             }))
         } else {
             Ok(None)

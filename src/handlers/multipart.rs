@@ -12,6 +12,7 @@ use axum::{
     response::IntoResponse,
 };
 use crate::{AppState, S3Error, S3ErrorCode, MultipartPart, S3ObjectMetadata, MultipartUpload};
+use sha2::Digest;
 use super::validate_auth;
 
 #[derive(serde::Serialize)]
@@ -116,33 +117,101 @@ pub async fn put_handler(
             format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml)
         ).into_response())
     } else {
-        tracing::info!(bucket = %bucket, key = %key, "PUT Object (Streaming)");
-        let size: u64 = state.storage.put(&bucket, &key, body, &expected_payload_hash).await
-            .map_err(|e| {
-                if e.to_string().contains("Checksum mismatch") {
-                    S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
+        let snowball_auto_extract = headers.get("x-amz-meta-snowball-auto-extract")
+            .and_then(|h| h.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if snowball_auto_extract {
+            tracing::info!(bucket = %bucket, key = %key, "PUT Snowball (auto-extract)");
+            // Buffer the entire body
+            let body_bytes = axum::body::to_bytes(body, usize::MAX).await
+                .map_err(|e| S3Error::internal(e))?;
+
+            // Parse tar in a blocking thread (tar::Archive is not Send)
+            let extracted: Vec<(String, bytes::Bytes)> = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+
+                // Decompress if gzip (magic bytes 0x1f 0x8b)
+                let tar_data: Vec<u8> = if body_bytes.starts_with(&[0x1f, 0x8b]) {
+                    let mut decoder = flate2::read::GzDecoder::new(&body_bytes[..]);
+                    let mut buf = Vec::new();
+                    decoder.read_to_end(&mut buf)?;
+                    buf
                 } else {
-                    S3Error::internal(e)
+                    body_bytes.to_vec()
+                };
+
+                let mut archive = tar::Archive::new(std::io::Cursor::new(tar_data));
+                let mut result = Vec::new();
+                for entry in archive.entries()? {
+                    let mut entry = entry?;
+                    if entry.header().entry_type().is_dir() {
+                        continue;
+                    }
+                    let entry_key = entry.path()?
+                        .to_string_lossy()
+                        .trim_start_matches("./")
+                        .to_string();
+                    if entry_key.is_empty() {
+                        continue;
+                    }
+                    let mut data = Vec::new();
+                    entry.read_to_end(&mut data)?;
+                    result.push((entry_key, bytes::Bytes::from(data)));
                 }
-            })?;
+                Ok::<_, std::io::Error>(result)
+            })
+            .await
+            .map_err(|e| S3Error::internal(e))?
+            .map_err(|e| S3Error::internal(e))?;
 
-        let metadata: HashMap<String, String> = headers.iter()
-            .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))
-            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let metadata_json = serde_json::to_string(&metadata).ok();
+            for (entry_key, data_bytes) in extracted {
+                let size = data_bytes.len() as u64;
+                let checksum = hex::encode(sha2::Sha256::digest(&data_bytes));
+                state.storage.put_bytes(&bucket, &entry_key, data_bytes, "UNSIGNED-PAYLOAD").await
+                    .map_err(|e| S3Error::internal(e))?;
+                state.bucket_meta.save_object(S3ObjectMetadata {
+                    bucket: bucket.clone(),
+                    key: entry_key,
+                    size,
+                    content_type: "application/octet-stream".to_string(),
+                    checksum,
+                    metadata: None,
+                    created_at: chrono::Utc::now(),
+                }).await?;
+            }
 
-        state.bucket_meta.save_object(S3ObjectMetadata {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            size,
-            content_type: headers.get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("application/octet-stream").to_string(),
-            checksum: expected_payload_hash.to_string(),
-            metadata: metadata_json,
-            created_at: chrono::Utc::now(),
-        }).await?;
+            Ok(StatusCode::OK.into_response())
+        } else {
+            tracing::info!(bucket = %bucket, key = %key, "PUT Object (Streaming)");
+            let size: u64 = state.storage.put(&bucket, &key, body, &expected_payload_hash).await
+                .map_err(|e| {
+                    if e.to_string().contains("Checksum mismatch") {
+                        S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
+                    } else {
+                        S3Error::internal(e)
+                    }
+                })?;
 
-        Ok(StatusCode::OK.into_response())
+            let metadata: HashMap<String, String> = headers.iter()
+                .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            let metadata_json = serde_json::to_string(&metadata).ok();
+
+            state.bucket_meta.save_object(S3ObjectMetadata {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                size,
+                content_type: headers.get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("application/octet-stream").to_string(),
+                checksum: expected_payload_hash.to_string(),
+                metadata: metadata_json,
+                created_at: chrono::Utc::now(),
+            }).await?;
+
+            Ok(StatusCode::OK.into_response())
+        }
     }
 }
 
@@ -243,7 +312,13 @@ pub async fn post_handler(
 
     // 2. Proceed with Logic
     if query_map.contains_key("uploads") {
-        let upload_id: String = state.multipart_meta.initiate_multipart(&bucket, &key).await?;
+        let metadata: HashMap<String, String> = headers.iter()
+            .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let metadata_json = if metadata.is_empty() { None } else { serde_json::to_string(&metadata).ok() };
+        let content_type = headers.get("content-type").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+        let upload_id: String = state.multipart_meta.initiate_multipart(&bucket, &key, metadata_json, content_type).await?;
         let response = InitiateMultipartResponse {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -283,9 +358,9 @@ pub async fn post_handler(
             bucket: bucket.clone(),
             key: key.clone(),
             size: total_size,
-            content_type: "application/octet-stream".to_string(),
+            content_type: upload.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
             checksum: etag.clone(),
-            metadata: None,
+            metadata: upload.metadata,
             created_at: chrono::Utc::now(),
         }).await?;
 
