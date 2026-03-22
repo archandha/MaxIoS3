@@ -12,6 +12,12 @@ use sha2::{Digest, Sha256};
 use md5::Md5;
 use tokio::io::AsyncWriteExt;
 
+/// Returns true only when the checksum is an actual hex SHA256 that should be verified.
+/// Sentinel values like UNSIGNED-PAYLOAD and STREAMING-AWS4-HMAC-SHA256-PAYLOAD are skipped.
+fn is_real_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// The StorageEngine trait defines how data is physically stored.
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
@@ -120,7 +126,7 @@ impl StorageEngine for FileSystemStorage {
         let calculated_sha256 = hex::encode(sha256.finalize());
         let md5_hex = hex::encode(md5.finalize());
 
-        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_sha256 != expected_checksum {
+        if is_real_sha256(expected_checksum) && calculated_sha256 != expected_checksum {
             drop(file);
             tokio::fs::remove_file(&file_path).await?;
             return Err(anyhow!("Checksum mismatch: expected {}, got {}", expected_checksum, calculated_sha256));
@@ -171,7 +177,7 @@ impl StorageEngine for FileSystemStorage {
         let calculated_sha256 = hex::encode(sha256.finalize());
         let md5_hex = hex::encode(md5.finalize());
 
-        if expected_checksum != "UNSIGNED-PAYLOAD" && calculated_sha256 != expected_checksum {
+        if is_real_sha256(expected_checksum) && calculated_sha256 != expected_checksum {
             drop(file);
             tokio::fs::remove_file(&part_path).await?;
             return Err(anyhow!("Checksum mismatch for part {}: expected {}, got {}", part_number, expected_checksum, calculated_sha256));
@@ -227,7 +233,7 @@ impl StorageEngine for FileSystemStorage {
         }
 
         let sha256 = hex::encode(Sha256::digest(&data));
-        if expected_checksum != "UNSIGNED-PAYLOAD" && sha256 != expected_checksum {
+        if is_real_sha256(expected_checksum) && sha256 != expected_checksum {
             return Err(anyhow!("Checksum mismatch: expected {}, got {}", expected_checksum, sha256));
         }
 

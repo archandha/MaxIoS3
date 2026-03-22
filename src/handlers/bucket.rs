@@ -87,6 +87,7 @@ pub struct ListObjectsV1Response {
     pub prefix: String,
     pub marker: String,
     pub max_keys: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Contents")]
@@ -108,6 +109,7 @@ pub struct ListObjectsV2Response {
     pub name: String,
     pub prefix: String,
     pub max_keys: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
     pub is_truncated: bool,
     pub key_count: usize,
@@ -208,6 +210,9 @@ pub async fn list_objects(
     if all_query.iter().any(|(k, _)| k == "location") {
         return get_bucket_location(method, uri, bucket, all_query, state, headers).await;
     }
+    if all_query.iter().any(|(k, _)| k == "uploads") {
+        return list_multipart_uploads(method, uri, bucket, all_query, state, headers).await;
+    }
     if bucket == "minio" && all_query.iter().any(|(k, _)| k == "metrics") {
         return get_metrics().await;
     }
@@ -217,10 +222,36 @@ pub async fn list_objects(
         return get_bucket_lifecycle(method, uri, bucket, all_query, state, headers).await;
     }
 
-    // GET /bucket?<other unsupported sub-resources>
+    // GET /bucket?notification — return empty config (200 OK, not 404)
+    if all_query.iter().any(|(k, _)| k == "notification") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>".to_string(),
+        ).into_response());
+    }
+
+    // GET /bucket?versioning — return empty config (200 OK)
+    if all_query.iter().any(|(k, _)| k == "versioning") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>".to_string(),
+        ).into_response());
+    }
+
+    // GET /bucket?<other unsupported sub-resources> → 404
     const UNSUPPORTED_GET_SUB: &[&str] = &[
-        "versioning", "tagging", "cors", "acl",
-        "website", "logging", "replication", "notification",
+        "tagging", "cors", "acl",
+        "website", "logging", "replication",
         "accelerate", "requestPayment", "encryption", "intelligent-tiering",
         "inventory", "metrics", "ownershipControls", "publicAccessBlock",
     ];
@@ -284,15 +315,22 @@ pub async fn list_objects(
         objects = filtered_objects;
     }
 
-    // Parse max-keys: negative means "no limit" (pass-through the value, return all)
+    // Parse max-keys: negative values are invalid per S3 spec → return error
     let max_keys: i64 = all_query.iter().find(|(k, _)| k == "max-keys")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(1000);
-    let effective_limit = if max_keys < 0 { usize::MAX } else { max_keys as usize };
+    if max_keys < 0 {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Argument maxKeys must be an integer between 0 and 2147483647",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    let effective_limit = max_keys as usize;
 
-    // Apply max-keys limit
+    // Apply max-keys limit (0 means return no results)
     let is_truncated = objects.len() > effective_limit;
-    if is_truncated {
+    if is_truncated || effective_limit == 0 {
         objects.truncate(effective_limit);
     }
 
@@ -756,6 +794,46 @@ async fn delete_bucket_policy(
     state.bucket_meta.delete_bucket_policy(&bucket).await?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn list_multipart_uploads(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    bucket: String,
+    all_query: Vec<(String, String)>,
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, S3Error> {
+    let (params, _) = validate_auth(
+        &state, method.as_str(), uri.path(), &all_query, &headers,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ).await?;
+    super::validate_policy(&state, &params, method.as_str(), &bucket, None).await?;
+
+    let prefix = all_query.iter().find(|(k, _)| k == "prefix").map(|(_, v)| v.as_str()).unwrap_or("");
+    let uploads = state.multipart_meta.list_multipart_uploads(&bucket, prefix).await?;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket><KeyMarker/><UploadIdMarker/><MaxUploads>1000</MaxUploads>\
+         <IsTruncated>false</IsTruncated>",
+        bucket
+    );
+    for u in &uploads {
+        xml.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId>\
+             <Initiator><ID>admin</ID><DisplayName>admin</DisplayName></Initiator>\
+             <Owner><ID>admin</ID><DisplayName>admin</DisplayName></Owner>\
+             <StorageClass>STANDARD</StorageClass>\
+             <Initiated>{}</Initiated></Upload>",
+            u.key, u.upload_id,
+            u.initiated.format("%Y-%m-%dT%H:%M:%S.000Z")
+        ));
+    }
+    xml.push_str("</ListMultipartUploadsResult>");
+
+    Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/xml")], xml).into_response())
 }
 
 async fn get_bucket_lifecycle(

@@ -106,6 +106,21 @@ pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, S3Error> {
+    // AbortMultipartUpload: DELETE /bucket/key?uploadId=...
+    if let Some(upload_id) = all_query.iter().find(|(k, _)| k == "uploadId").map(|(_, v)| v.clone()) {
+        tracing::info!(bucket = %bucket, key = %key, upload_id = %upload_id, "Abort Multipart Upload");
+
+        let (params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        super::validate_policy(&state, &params, method.as_str(), &bucket, Some(&key)).await?;
+
+        state.storage.cleanup_multipart(&upload_id).await?;
+        state.multipart_meta.complete_multipart(&upload_id).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     tracing::info!(bucket = %bucket, key = %key, "DELETE Object");
 
     let (params, _) = validate_auth(

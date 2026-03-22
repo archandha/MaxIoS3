@@ -31,6 +31,7 @@ pub enum S3ErrorCode {
     NoSuchLifecycleConfiguration,
     MalformedPolicy,
     XAmzContentSHA256Mismatch,
+    InvalidDigest,
     MethodNotAllowed,
     MalformedXML,
     InvalidArgument,

@@ -189,6 +189,11 @@ pub async fn put_handler(
 
             Ok(StatusCode::OK.into_response())
         } else {
+            // Validate Content-MD5 if provided (before streaming, check format; after, check value)
+            let content_md5_header = headers.get("content-md5")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.trim().to_string());
+
             tracing::info!(bucket = %bucket, key = %key, "PUT Object (Streaming)");
             let (size, md5) = state.storage.put(&bucket, &key, body, &expected_payload_hash).await
                 .map_err(|e| {
@@ -198,6 +203,21 @@ pub async fn put_handler(
                         S3Error::internal(e)
                     }
                 })?;
+
+            // If Content-MD5 was provided, validate it against the computed MD5
+            if let Some(ref provided_md5_b64) = content_md5_header {
+                use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+                let provided_md5_bytes = BASE64.decode(provided_md5_b64)
+                    .map_err(|_| S3Error::new(S3ErrorCode::InvalidDigest, "The Content-MD5 you specified is not valid.", StatusCode::BAD_REQUEST))?;
+                if provided_md5_bytes.len() != 16 {
+                    return Err(S3Error::new(S3ErrorCode::InvalidDigest, "The Content-MD5 you specified is not valid.", StatusCode::BAD_REQUEST));
+                }
+                let computed_md5_bytes = hex::decode(&md5)
+                    .map_err(|e| S3Error::internal(e))?;
+                if provided_md5_bytes != computed_md5_bytes {
+                    return Err(S3Error::new(S3ErrorCode::BadDigest, "The Content-MD5 you specified did not match what we received.", StatusCode::BAD_REQUEST));
+                }
+            }
 
             let metadata: HashMap<String, String> = headers.iter()
                 .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))

@@ -25,6 +25,14 @@ pub struct MultipartUpload {
     pub storage_class: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultipartUploadSummary {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub initiated: chrono::DateTime<chrono::Utc>,
+}
+
 #[async_trait]
 pub trait MultipartMetadataEngine: Send + Sync {
     async fn initiate_multipart(&self, bucket: &str, key: &str, metadata: Option<String>, content_type: Option<String>, storage_class: Option<String>) -> Result<String>;
@@ -32,4 +40,5 @@ pub trait MultipartMetadataEngine: Send + Sync {
     async fn get_multipart(&self, upload_id: &str) -> Result<Option<MultipartUpload>>;
     async fn complete_multipart(&self, upload_id: &str) -> Result<()>;
     async fn find_stale_multipart_uploads(&self, older_than_seconds: u64) -> Result<Vec<String>>;
+    async fn list_multipart_uploads(&self, bucket: &str, prefix: &str) -> Result<Vec<MultipartUploadSummary>>;
 }

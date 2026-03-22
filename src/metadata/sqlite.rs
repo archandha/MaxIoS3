@@ -320,6 +320,23 @@ impl MultipartMetadataEngine for SqliteMetadata {
         Ok(())
     }
 
+    async fn list_multipart_uploads(&self, bucket: &str, prefix: &str) -> Result<Vec<crate::metadata::multipart::MultipartUploadSummary>> {
+        let rows = sqlx::query(
+            "SELECT upload_id, bucket, key, created_at FROM multipart_uploads WHERE bucket = ? AND key LIKE ?"
+        )
+        .bind(bucket)
+        .bind(format!("{}%", prefix))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| crate::metadata::multipart::MultipartUploadSummary {
+            upload_id: r.get("upload_id"),
+            bucket: r.get("bucket"),
+            key: r.get("key"),
+            initiated: r.get("created_at"),
+        }).collect())
+    }
+
     async fn find_stale_multipart_uploads(&self, older_than_seconds: u64) -> Result<Vec<String>> {
         let rows = sqlx::query(
             "SELECT upload_id FROM multipart_uploads WHERE created_at < datetime('now', '-' || ? || ' seconds')"
