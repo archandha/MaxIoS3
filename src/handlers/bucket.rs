@@ -235,37 +235,83 @@ pub async fn list_objects(
         ).into_response());
     }
 
-    // GET /bucket?versioning — return empty config (200 OK)
+    // GET /bucket?versioning
     if all_query.iter().any(|(k, _)| k == "versioning") {
         let (_params, _) = validate_auth(
             &state, method.as_str(), uri.path(), &all_query, &headers,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ).await?;
+        let body = match state.bucket_meta.get_bucket_versioning(&bucket).await? {
+            Some(status) => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                <Status>{}</Status></VersioningConfiguration>",
+                status
+            ),
+            None => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>".to_string(),
+        };
         return Ok((
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/xml")],
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>".to_string(),
+            body,
         ).into_response());
     }
 
-    // GET /bucket?<other unsupported sub-resources> → 404
-    const UNSUPPORTED_GET_SUB: &[&str] = &[
-        "tagging", "cors", "acl",
-        "website", "logging", "replication",
-        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
-        "inventory", "metrics", "ownershipControls", "publicAccessBlock",
-    ];
-    if all_query.iter().any(|(k, _)| UNSUPPORTED_GET_SUB.contains(&k.as_str())) {
+    // GET /bucket?object-lock
+    if all_query.iter().any(|(k, _)| k == "object-lock") {
         let (_params, _) = validate_auth(
             &state, method.as_str(), uri.path(), &all_query, &headers,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ).await?;
-        tracing::info!(bucket = %bucket, "GET sub-resource (stub 404)");
-        return Err(S3Error::new(
-            S3ErrorCode::NoSuchLifecycleConfiguration,
-            "The lifecycle configuration does not exist.",
-            StatusCode::NOT_FOUND,
-        ));
+        let body = match state.bucket_meta.get_object_lock_config(&bucket).await? {
+            Some(xml) => xml,
+            None => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                <ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                <ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                </ObjectLockConfiguration>".to_string(),
+        };
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            body,
+        ).into_response());
+    }
+
+    // GET /bucket?<config sub-resource> — return stored XML or 404
+    const CONFIG_GET_SUB: &[&str] = &[
+        "tagging", "acl",
+        "website", "logging", "replication",
+        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
+        "inventory", "metrics", "ownershipControls", "publicAccessBlock",
+    ];
+    if let Some((config_type, _)) = all_query.iter().find(|(k, _)| CONFIG_GET_SUB.contains(&k.as_str())) {
+        let config_type = config_type.clone();
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        let stored = state.bucket_meta.get_bucket_config(&bucket, &config_type).await?;
+        let xml = match stored {
+            Some(xml) => xml,
+            None => match config_type.as_str() {
+                "encryption" => return Err(S3Error::new(
+                    S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError,
+                    "The server side encryption configuration was not found",
+                    StatusCode::NOT_FOUND,
+                )),
+                _ => return Err(S3Error::new(
+                    S3ErrorCode::NoSuchLifecycleConfiguration,
+                    "The lifecycle configuration does not exist.",
+                    StatusCode::NOT_FOUND,
+                )),
+            },
+        };
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            xml,
+        ).into_response());
     }
 
     tracing::info!(bucket = %bucket, "List Objects");
@@ -441,19 +487,60 @@ pub async fn create_bucket(
         return put_bucket_lifecycle(method, uri, bucket, all_query, state, headers, body).await;
     }
 
-    // PUT /bucket?<other unsupported sub-resources>: accept and ignore
-    const UNSUPPORTED_PUT_SUB: &[&str] = &[
-        "versioning", "tagging", "cors", "acl",
-        "website", "logging", "replication", "notification",
-        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
-        "inventory", "metrics", "ownershipControls", "publicAccessBlock",
-    ];
-    if all_query.iter().any(|(k, _)| UNSUPPORTED_PUT_SUB.contains(&k.as_str())) {
+    // PUT /bucket?versioning
+    if all_query.iter().any(|(k, _)| k == "versioning") {
         let (_params, _) = validate_auth(
             &state, method.as_str(), uri.path(), &all_query, &headers,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ).await?;
-        tracing::info!(bucket = %bucket, "PUT sub-resource (stub 200)");
+        let body_bytes = axum::body::to_bytes(body, 1024 * 1024).await
+            .map_err(|e| S3Error::internal(e))?;
+        let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
+        // Extract <Status>...</Status> from the XML
+        if let Some(start) = body_str.find("<Status>") {
+            if let Some(end) = body_str.find("</Status>") {
+                let status = &body_str[start + 8..end];
+                if status == "Enabled" || status == "Suspended" {
+                    state.bucket_meta.set_bucket_versioning(&bucket, status).await?;
+                }
+            }
+        }
+        tracing::info!(bucket = %bucket, "Set bucket versioning");
+        return Ok(StatusCode::OK.into_response());
+    }
+
+    // PUT /bucket?object-lock
+    if all_query.iter().any(|(k, _)| k == "object-lock") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        let body_bytes = axum::body::to_bytes(body, 1024 * 1024).await
+            .map_err(|e| S3Error::internal(e))?;
+        let xml = String::from_utf8_lossy(&body_bytes).to_string();
+        state.bucket_meta.set_object_lock_config(&bucket, xml).await?;
+        tracing::info!(bucket = %bucket, "Set object lock configuration");
+        return Ok(StatusCode::OK.into_response());
+    }
+
+    // PUT /bucket?<config sub-resource>: store the XML body
+    const CONFIG_PUT_SUB: &[&str] = &[
+        "tagging", "acl",
+        "website", "logging", "replication", "notification",
+        "accelerate", "requestPayment", "encryption", "intelligent-tiering",
+        "inventory", "metrics", "ownershipControls", "publicAccessBlock",
+    ];
+    if let Some((config_type, _)) = all_query.iter().find(|(k, _)| CONFIG_PUT_SUB.contains(&k.as_str())) {
+        let config_type = config_type.clone();
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        let body_bytes = axum::body::to_bytes(body, 1024 * 1024).await
+            .map_err(|e| S3Error::internal(e))?;
+        let xml = String::from_utf8_lossy(&body_bytes).to_string();
+        state.bucket_meta.set_bucket_config(&bucket, &config_type, xml).await?;
+        tracing::info!(bucket = %bucket, config_type = %config_type, "PUT bucket config");
         return Ok(StatusCode::OK.into_response());
     }
 
@@ -502,19 +589,21 @@ pub async fn delete_bucket(
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
-    // DELETE /bucket?<other sub-resources> — just ack with 204
-    const SUB_RESOURCES: &[&str] = &[
+    // DELETE /bucket?<config sub-resource> — delete stored config and ack 204
+    const CONFIG_DEL_SUB: &[&str] = &[
         "versioning", "tagging", "cors", "acl",
         "website", "logging", "replication", "notification",
         "accelerate", "requestPayment", "encryption", "intelligent-tiering",
         "inventoryId", "metrics", "ownershipControls", "publicAccessBlock",
     ];
-    if all_query.iter().any(|(k, _)| SUB_RESOURCES.contains(&k.as_str())) {
+    if let Some((config_type, _)) = all_query.iter().find(|(k, _)| CONFIG_DEL_SUB.contains(&k.as_str())) {
+        let config_type = config_type.clone();
         let (_params, _) = validate_auth(
             &state, method.as_str(), uri.path(), &all_query, &headers,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ).await?;
-        tracing::info!(bucket = %bucket, "Delete sub-resource (stub 204)");
+        state.bucket_meta.delete_bucket_config(&bucket, &config_type).await?;
+        tracing::info!(bucket = %bucket, config_type = %config_type, "Delete bucket config");
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 

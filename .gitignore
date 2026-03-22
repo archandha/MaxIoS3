@@ -8,5 +8,5 @@ Cargo.lock
 Cargo.lock.backup
 .idea
 .vscode
-.claude
+.claude/*
 metadata.db

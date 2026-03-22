@@ -101,6 +101,31 @@ impl SqliteMetadata {
             )"
         ).execute(&pool).await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bucket_versioning (
+                bucket TEXT PRIMARY KEY,
+                status TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )"
+        ).execute(&pool).await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bucket_object_lock (
+                bucket TEXT PRIMARY KEY,
+                config TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )"
+        ).execute(&pool).await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bucket_configs (
+                bucket TEXT NOT NULL,
+                config_type TEXT NOT NULL,
+                xml TEXT NOT NULL,
+                PRIMARY KEY (bucket, config_type)
+            )"
+        ).execute(&pool).await?;
+
         Ok(Self { pool })
     }
 }
@@ -240,6 +265,72 @@ impl BucketMetadataEngine for SqliteMetadata {
     async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()> {
         sqlx::query("DELETE FROM bucket_lifecycle WHERE bucket = ?")
             .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM bucket_versioning WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(s,)| s))
+    }
+
+    async fn set_bucket_versioning(&self, bucket: &str, status: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO bucket_versioning (bucket, status) VALUES (?, ?)")
+            .bind(bucket)
+            .bind(status)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_object_lock_config(&self, bucket: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT config FROM bucket_object_lock WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(c,)| c))
+    }
+
+    async fn set_object_lock_config(&self, bucket: &str, config_xml: String) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO bucket_object_lock (bucket, config) VALUES (?, ?)")
+            .bind(bucket)
+            .bind(config_xml)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_bucket_config(&self, bucket: &str, config_type: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT xml FROM bucket_configs WHERE bucket = ? AND config_type = ?"
+        )
+            .bind(bucket)
+            .bind(config_type)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(x,)| x))
+    }
+
+    async fn set_bucket_config(&self, bucket: &str, config_type: &str, xml: String) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO bucket_configs (bucket, config_type, xml) VALUES (?, ?, ?)"
+        )
+            .bind(bucket)
+            .bind(config_type)
+            .bind(xml)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_bucket_config(&self, bucket: &str, config_type: &str) -> Result<()> {
+        sqlx::query("DELETE FROM bucket_configs WHERE bucket = ? AND config_type = ?")
+            .bind(bucket)
+            .bind(config_type)
             .execute(&self.pool)
             .await?;
         Ok(())

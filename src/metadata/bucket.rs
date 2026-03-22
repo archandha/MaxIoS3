@@ -68,4 +68,17 @@ pub trait BucketMetadataEngine: Send + Sync {
     async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>>;
     async fn set_bucket_lifecycle(&self, bucket: &str, lifecycle_xml: String) -> Result<()>;
     async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()>;
+
+    // Bucket Versioning methods (status: "Enabled", "Suspended", or None)
+    async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<String>>;
+    async fn set_bucket_versioning(&self, bucket: &str, status: &str) -> Result<()>;
+
+    // Object Lock Configuration (stored as raw XML)
+    async fn get_object_lock_config(&self, bucket: &str) -> Result<Option<String>>;
+    async fn set_object_lock_config(&self, bucket: &str, config_xml: String) -> Result<()>;
+
+    // Generic sub-resource config storage (encryption, tagging, cors, etc.)
+    async fn get_bucket_config(&self, bucket: &str, config_type: &str) -> Result<Option<String>>;
+    async fn set_bucket_config(&self, bucket: &str, config_type: &str, xml: String) -> Result<()>;
+    async fn delete_bucket_config(&self, bucket: &str, config_type: &str) -> Result<()>;
 }
