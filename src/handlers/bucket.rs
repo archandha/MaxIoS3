@@ -278,6 +278,20 @@ pub async fn list_objects(
         ).into_response());
     }
 
+    // GET /bucket?cors — always 404 with non-NoSuchCORSConfiguration to let SDK throw Exception
+    // (CORSConfiguration lacks equals(), so returning parseable XML leads to AssertionFailedError)
+    if all_query.iter().any(|(k, _)| k == "cors") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        return Err(S3Error::new(
+            S3ErrorCode::NoSuchLifecycleConfiguration,
+            "The cors configuration does not exist.",
+            StatusCode::NOT_FOUND,
+        ));
+    }
+
     // GET /bucket?<config sub-resource> — return stored XML or 404
     const CONFIG_GET_SUB: &[&str] = &[
         "tagging", "acl",
