@@ -80,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/minio/health/live", get(|| async { StatusCode::OK }))
         .route("/minio/health/ready", get(|| async { StatusCode::OK }))
         .route("/minio/v2/metrics/cluster", get(|| async { "maxios3_metrics 1\n" }))
+        .route("/minio/v2/metrics/node", get(|| async { "maxios3_metrics 1\n" }))
+        .route("/minio/v2/metrics/bucket", get(|| async { "maxios3_metrics 1\n" }))
+        .route("/minio/v2/metrics/resource", get(|| async { "maxios3_metrics 1\n" }))
         .route("/", get(handlers::bucket::list_buckets))
         .route("/", head(handlers::bucket::list_buckets))
         .route("/{bucket}", get(handlers::bucket::list_objects))
@@ -104,9 +107,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(method = %method, uri = %uri, query = ?query, "Route hit (PUT): /{{bucket}}/{{*key}}");
             handlers::multipart::put_handler(method, axum::extract::OriginalUri(uri), path, query, state, headers, body).await
         }))
-        .route("/{bucket}/{*key}", post(|method: axum::http::Method, uri: axum::http::Uri, path: Path<(String, String)>, query: Query<Vec<(String, String)>>, state: State<Arc<AppState>>, headers: axum::http::HeaderMap| async move {
+        .route("/{bucket}/{*key}", post(|method: axum::http::Method, uri: axum::http::Uri, path: Path<(String, String)>, query: Query<Vec<(String, String)>>, state: State<Arc<AppState>>, headers: axum::http::HeaderMap, body: axum::body::Body| async move {
             tracing::info!(method = %method, uri = %uri, query = ?query, "Route hit (POST): /{{bucket}}/{{*key}}");
-            handlers::multipart::post_handler(method, axum::extract::OriginalUri(uri), path, query, state, headers).await
+            handlers::multipart::post_handler(method, axum::extract::OriginalUri(uri), path, query, state, headers, body).await
         }))
         .route("/{bucket}/{*key}", delete(|method: axum::http::Method, uri: axum::http::Uri, path: Path<(String, String)>, query: Query<Vec<(String, String)>>, state: State<Arc<AppState>>, headers: axum::http::HeaderMap| async move {
             tracing::info!(method = %method, uri = %uri, query = ?query, "Route hit (DELETE): /{{bucket}}/{{*key}}");

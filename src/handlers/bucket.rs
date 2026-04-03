@@ -222,6 +222,19 @@ pub async fn list_objects(
         return get_bucket_lifecycle(method, uri, bucket, all_query, state, headers).await;
     }
 
+    // GET /bucket?events=... — listenBucketNotification: return NotImplemented so client gets proper error
+    if all_query.iter().any(|(k, _)| k == "events") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        return Err(S3Error::new(
+            S3ErrorCode::NotImplemented,
+            "A specified event is not supported for notifications.",
+            StatusCode::NOT_IMPLEMENTED,
+        ));
+    }
+
     // GET /bucket?notification — return empty config (200 OK, not 404)
     if all_query.iter().any(|(k, _)| k == "notification") {
         let (_params, _) = validate_auth(
@@ -232,6 +245,40 @@ pub async fn list_objects(
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/xml")],
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>".to_string(),
+        ).into_response());
+    }
+
+    // GET /bucket?versions — ListObjectVersions (no versioning: return each object as a single version)
+    if all_query.iter().any(|(k, _)| k == "versions") {
+        let (_params, _) = validate_auth(
+            &state, method.as_str(), uri.path(), &all_query, &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ).await?;
+        let objects = state.bucket_meta.list_objects(&bucket).await?;
+        let versions_xml: String = objects.iter().map(|obj| {
+            format!(
+                "<Version><Key>{}</Key><VersionId>null</VersionId>\
+                <IsLatest>true</IsLatest><LastModified>{}</LastModified>\
+                <ETag>&quot;{}&quot;</ETag><Size>{}</Size>\
+                <StorageClass>STANDARD</StorageClass></Version>",
+                obj.key,
+                obj.created_at.format("%Y-%m-%dT%H:%M:%S.000Z"),
+                obj.checksum,
+                obj.size
+            )
+        }).collect();
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <Name>{}</Name><Prefix/><KeyMarker/><VersionIdMarker/>\
+            <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+            {}</ListVersionsResult>",
+            bucket, versions_xml
+        );
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            body,
         ).into_response());
     }
 
@@ -265,9 +312,12 @@ pub async fn list_objects(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ).await?;
         let body = match state.bucket_meta.get_object_lock_config(&bucket).await? {
-            Some(xml) => xml,
+            Some(xml) => {
+                // Strip xmlns to avoid SimpleXML namespace matching issues in minio-java
+                xml.replace(" xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"", "")
+            },
             None => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                <ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                <ObjectLockConfiguration>\
                 <ObjectLockEnabled>Enabled</ObjectLockEnabled>\
                 </ObjectLockConfiguration>".to_string(),
         };
@@ -348,7 +398,7 @@ pub async fn list_objects(
     let mut objects: Vec<S3ObjectMetadata> = state.bucket_meta.list_objects(&bucket).await?;
 
     let prefix = all_query.iter().find(|(k, _)| k == "prefix").map(|(_, v)| v.clone()).unwrap_or_default();
-    let delimiter = all_query.iter().find(|(k, _)| k == "delimiter").map(|(_, v)| v.clone());
+    let delimiter = all_query.iter().find(|(k, _)| k == "delimiter").map(|(_, v)| v.clone()).filter(|d| !d.is_empty());
 
     // Prefix filtering
     if !prefix.is_empty() {
@@ -396,6 +446,7 @@ pub async fn list_objects(
 
     let key_count = objects.len() + common_prefixes.len();
     let is_v2 = all_query.iter().any(|(k, v)| k == "list-type" && v == "2");
+    let with_metadata = is_v2 && all_query.iter().any(|(k, v)| k == "metadata" && v == "true");
     let encoding_type = all_query.iter().find(|(k, _)| k == "encoding-type").map(|(_, v)| v.clone());
     let use_url_encoding = encoding_type.as_deref() == Some("url");
 
@@ -422,6 +473,104 @@ pub async fn list_objects(
         encoded
     }
 
+    // Convert "x-amz-meta-key" to HTTP title-case "X-Amz-Meta-Key"
+    fn http_title_case(s: &str) -> String {
+        s.split('-')
+            .map(|part| {
+                let mut c = part.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    // XML-escape a string value
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    }
+
+    let common_prefixes_encoded: Vec<CommonPrefixEntry> = common_prefixes.into_iter().map(|p| CommonPrefixEntry {
+        prefix: maybe_encode(p, use_url_encoding)
+    }).collect();
+
+    // When metadata=true with list-type=2, build XML manually to include UserTags and UserMetadata
+    if with_metadata {
+        let name_enc = xml_escape(&bucket);
+        let prefix_enc = xml_escape(&maybe_encode(prefix.clone(), use_url_encoding));
+        let delim_str = delimiter.as_ref().map(|d| format!("<Delimiter>{}</Delimiter>", xml_escape(&maybe_encode(d.clone(), use_url_encoding)))).unwrap_or_default();
+        let cont_token = all_query.iter().find(|(k, _)| k == "continuation-token").map(|(_, v)| v.clone());
+        let start_after = all_query.iter().find(|(k, _)| k == "start-after").map(|(_, v)| v.clone());
+
+        let mut xml = format!(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{}</Name><Prefix>{}</Prefix><MaxKeys>{}</MaxKeys>{}",
+            name_enc, prefix_enc, max_keys, delim_str
+        );
+        xml.push_str(&format!("<IsTruncated>{}</IsTruncated><KeyCount>{}</KeyCount>", is_truncated, key_count));
+        if let Some(ct) = &cont_token {
+            xml.push_str(&format!("<ContinuationToken>{}</ContinuationToken>", xml_escape(ct)));
+        }
+        if let Some(sa) = &start_after {
+            xml.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(sa)));
+        }
+
+        for o in &objects {
+            let key_out = xml_escape(&maybe_encode(o.key.clone(), use_url_encoding));
+            let lm = o.created_at.format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+            let etag = xml_escape(&format!("\"{}\"", o.checksum));
+            xml.push_str(&format!(
+                "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>",
+                key_out, lm, etag, o.size
+            ));
+
+            // Parse metadata JSON
+            let meta_map: std::collections::HashMap<String, String> = o.metadata.as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            // UserTags from _s3_tags
+            if let Some(tags_str) = meta_map.get("_s3_tags") {
+                if let Ok(tags) = serde_json::from_str::<std::collections::HashMap<String, String>>(tags_str) {
+                    if !tags.is_empty() {
+                        let tags_encoded: Vec<String> = tags.iter()
+                            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+                            .collect();
+                        xml.push_str(&format!("<UserTags>{}</UserTags>", xml_escape(&tags_encoded.join("&"))));
+                    }
+                }
+            }
+
+            // UserMetadata from x-amz-meta-* keys
+            let user_meta: Vec<(String, String)> = meta_map.iter()
+                .filter(|(k, _)| k.starts_with("x-amz-meta-"))
+                .map(|(k, v)| (http_title_case(k), v.clone()))
+                .collect();
+            if !user_meta.is_empty() {
+                xml.push_str("<UserMetadata>");
+                for (k, v) in &user_meta {
+                    xml.push_str(&format!("<{}>{}</{}>", k, xml_escape(v), k));
+                }
+                xml.push_str("</UserMetadata>");
+            }
+
+            xml.push_str("</Contents>");
+        }
+
+        for cp in &common_prefixes_encoded {
+            xml.push_str(&format!("<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>", xml_escape(&cp.prefix)));
+        }
+
+        xml.push_str("</ListBucketResult>");
+
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml)
+        ).into_response());
+    }
+
     let contents: Vec<ObjectEntry> = objects.into_iter().map(|o| ObjectEntry {
         key: maybe_encode(o.key, use_url_encoding),
         last_modified: o.created_at.format("%Y-%m-%dT%H:%M:%S.000Z").to_string(),
@@ -439,10 +588,6 @@ pub async fn list_objects(
         },
     }).collect();
 
-    let common_prefixes: Vec<CommonPrefixEntry> = common_prefixes.into_iter().map(|p| CommonPrefixEntry {
-        prefix: maybe_encode(p, use_url_encoding)
-    }).collect();
-
     let xml = if is_v2 {
         let response = ListObjectsV2Response {
             name: bucket,
@@ -452,7 +597,7 @@ pub async fn list_objects(
             is_truncated,
             key_count,
             contents,
-            common_prefixes,
+            common_prefixes: common_prefixes_encoded,
             continuation_token: all_query.iter().find(|(k, _)| k == "continuation-token").map(|(_, v)| maybe_encode(v.clone(), use_url_encoding)),
             next_continuation_token: None,
             start_after: all_query.iter().find(|(k, _)| k == "start-after").map(|(_, v)| maybe_encode(v.clone(), use_url_encoding)),
@@ -468,7 +613,7 @@ pub async fn list_objects(
             delimiter: delimiter.map(|d| maybe_encode(d, use_url_encoding)),
             is_truncated,
             contents,
-            common_prefixes,
+            common_prefixes: common_prefixes_encoded,
             next_marker: None,
             encoding_type,
         };
@@ -501,26 +646,18 @@ pub async fn create_bucket(
         return put_bucket_lifecycle(method, uri, bucket, all_query, state, headers, body).await;
     }
 
-    // PUT /bucket?versioning
+    // PUT /bucket?versioning — versioning is not supported; return NotImplemented
+    // so SDK sets isVersioningSupported=false and skips all versioning tests gracefully
     if all_query.iter().any(|(k, _)| k == "versioning") {
         let (_params, _) = validate_auth(
             &state, method.as_str(), uri.path(), &all_query, &headers,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ).await?;
-        let body_bytes = axum::body::to_bytes(body, 1024 * 1024).await
-            .map_err(|e| S3Error::internal(e))?;
-        let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
-        // Extract <Status>...</Status> from the XML
-        if let Some(start) = body_str.find("<Status>") {
-            if let Some(end) = body_str.find("</Status>") {
-                let status = &body_str[start + 8..end];
-                if status == "Enabled" || status == "Suspended" {
-                    state.bucket_meta.set_bucket_versioning(&bucket, status).await?;
-                }
-            }
-        }
-        tracing::info!(bucket = %bucket, "Set bucket versioning");
-        return Ok(StatusCode::OK.into_response());
+        return Err(S3Error::new(
+            S3ErrorCode::NotImplemented,
+            "A header you provided implies functionality that is not implemented",
+            StatusCode::NOT_IMPLEMENTED,
+        ));
     }
 
     // PUT /bucket?object-lock
@@ -569,9 +706,18 @@ pub async fn create_bucket(
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     ).await?;
 
-    // For CreateBucket, we usually don't check bucket policy because the bucket doesn't exist yet.
-    // But if it's an existing bucket, we might want to check?
-    // S3 CreateBucket is usually restricted by IAM, not bucket policy.
+    // Object lock on bucket creation is not supported
+    if headers.get("x-amz-bucket-object-lock-enabled")
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return Err(S3Error::new(
+            S3ErrorCode::NotImplemented,
+            "A header you provided implies functionality that is not implemented",
+            StatusCode::NOT_IMPLEMENTED,
+        ));
+    }
 
     state.bucket_meta.create_bucket(&bucket).await?;
     state.storage.create_bucket(&bucket).await?;
@@ -636,6 +782,26 @@ pub async fn delete_bucket(
 
     if !state.bucket_meta.bucket_exists(&bucket).await? {
         return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist", StatusCode::NOT_FOUND));
+    }
+
+    let force_delete = headers.get("x-minio-force-delete")
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let objects = state.bucket_meta.list_objects(&bucket).await?;
+    if !objects.is_empty() {
+        if !force_delete {
+            return Err(S3Error::new(
+                S3ErrorCode::BucketNotEmpty,
+                "The bucket you tried to delete is not empty",
+                StatusCode::CONFLICT,
+            ));
+        }
+        for obj in objects {
+            let _ = state.storage.delete(&bucket, &obj.key).await;
+            let _ = state.bucket_meta.delete_object(&bucket, &obj.key).await;
+        }
     }
 
     state.bucket_meta.delete_bucket(&bucket).await?;

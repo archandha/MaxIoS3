@@ -14,6 +14,39 @@ use axum::{
 use crate::{AppState, S3Error, S3ErrorCode, MultipartPart, S3ObjectMetadata, MultipartUpload};
 use super::validate_auth;
 
+/// Validate an x-amz-checksum-* value against the provided data.
+/// Returns BadDigest if the checksum doesn't match.
+fn validate_amz_checksum(algo: &str, data: &[u8], expected_b64: &str) -> Result<(), S3Error> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    let computed_b64 = match algo {
+        "crc32" => {
+            let crc = crc32fast::hash(data);
+            BASE64.encode(crc.to_be_bytes())
+        }
+        "crc32c" => {
+            let crc = crc32c::crc32c(data);
+            BASE64.encode(crc.to_be_bytes())
+        }
+        "sha1" => {
+            use sha1::{Sha1, Digest};
+            BASE64.encode(Sha1::digest(data))
+        }
+        "sha256" => {
+            use sha2::{Sha256, Digest};
+            BASE64.encode(Sha256::digest(data))
+        }
+        _ => return Ok(()),
+    };
+    if computed_b64 != expected_b64 {
+        return Err(S3Error::new(
+            S3ErrorCode::BadDigest,
+            format!("The {} you specified did not match what we received.", algo.to_uppercase()),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    Ok(())
+}
+
 /// Decode AWS SigV4 streaming chunked body format.
 /// Each chunk: `{hex-size};chunk-signature={sig}\r\n{data}\r\n`
 /// Final chunk: `0;chunk-signature={sig}\r\n\r\n`
@@ -47,6 +80,75 @@ struct CopyObjectResponse {
     etag: String,
 }
 
+/// Handler for PUT /bucket/key?tagging — set object tags
+async fn put_object_tagging(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    bucket: String,
+    key: String,
+    all_query: Vec<(String, String)>,
+    state: std::sync::Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, S3Error> {
+    let (params, _) = validate_auth(
+        &state, method.as_str(), &uri.path(), &all_query, &headers,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ).await?;
+    super::validate_policy(&state, &params, method.as_str(), &bucket, Some(&key)).await?;
+
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| S3Error::internal(e))?;
+    let body_str = std::str::from_utf8(&body_bytes).map_err(|e| S3Error::internal(e))?;
+
+    // Parse <Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag>...</TagSet></Tagging>
+    let mut tags: HashMap<String, String> = HashMap::new();
+    let mut key_buf = String::new();
+    let mut val_buf = String::new();
+    let mut in_key = false;
+    let mut in_val = false;
+    let mut reader = quick_xml::Reader::from_str(body_str);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => match e.name().as_ref() {
+                b"Key" => { in_key = true; key_buf.clear(); }
+                b"Value" => { in_val = true; val_buf.clear(); }
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Text(e)) => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                if in_key { key_buf.push_str(&text); }
+                if in_val { val_buf.push_str(&text); }
+            }
+            Ok(quick_xml::events::Event::End(e)) => match e.name().as_ref() {
+                b"Key" => { in_key = false; }
+                b"Value" => { in_val = false; }
+                b"Tag" => { tags.insert(key_buf.clone(), val_buf.clone()); }
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Get existing metadata and update _s3_tags
+    let mut meta = state.bucket_meta.get_object(&bucket, &key).await?
+        .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey, "Object not found", StatusCode::NOT_FOUND))?;
+
+    let mut meta_map: HashMap<String, String> = meta.metadata
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let tags_json = serde_json::to_string(&tags).map_err(|e| S3Error::internal(e))?;
+    meta_map.insert("_s3_tags".to_string(), tags_json);
+    meta.metadata = serde_json::to_string(&meta_map).ok();
+
+    state.bucket_meta.save_object(meta).await?;
+    Ok(StatusCode::OK)
+}
+
 /// Unified handler for PUT requests (Object and Multipart Part)
 pub async fn put_handler(
     method: axum::http::Method,
@@ -57,6 +159,12 @@ pub async fn put_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<impl IntoResponse, S3Error> {
+    // PUT /bucket/key?tagging — set object tags
+    if all_query.iter().any(|(k, _)| k == "tagging") {
+        return put_object_tagging(method, uri, bucket, key, all_query, state, headers, body).await
+            .map(|r| r.into_response());
+    }
+
     // In streaming mode, we rely on the x-amz-content-sha256 header for the signature check.
     let payload_hash = headers.get("x-amz-content-sha256")
         .and_then(|h| h.to_str().ok())
@@ -83,14 +191,23 @@ pub async fn put_handler(
 
     if let (Some(upload_id), Some(part_number)) = (upload_id, part_number) {
         tracing::info!(upload_id = %upload_id, part = part_number, "Upload Part (Streaming)");
-        let (size, md5) = state.storage.put_part(upload_id, part_number, body, &expected_payload_hash).await
-            .map_err(|e| {
-                if e.to_string().contains("Checksum mismatch") {
-                    S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
-                } else {
-                    S3Error::internal(e)
-                }
-            })?;
+        let (size, md5) = if expected_payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+            let raw = axum::body::to_bytes(body, usize::MAX).await
+                .map_err(|e| S3Error::internal(e))?;
+            let decoded = decode_aws_chunked(&raw)
+                .map_err(|e| S3Error::internal(e))?;
+            state.storage.put_part(upload_id, part_number, axum::body::Body::from(bytes::Bytes::from(decoded)), "UNSIGNED-PAYLOAD").await
+                .map_err(|e| S3Error::internal(e))?
+        } else {
+            state.storage.put_part(upload_id, part_number, body, &expected_payload_hash).await
+                .map_err(|e| {
+                    if e.to_string().contains("Checksum mismatch") {
+                        S3Error::new(S3ErrorCode::XAmzContentSHA256Mismatch, e.to_string(), StatusCode::BAD_REQUEST)
+                    } else {
+                        S3Error::internal(e)
+                    }
+                })?
+        };
 
         state.multipart_meta.save_part(upload_id, MultipartPart {
             part_number,
@@ -115,6 +232,39 @@ pub async fn put_handler(
 
         let src_meta = state.bucket_meta.get_object(src_bucket, &src_key).await?
             .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey, "Source object not found", StatusCode::NOT_FOUND))?;
+
+        // Check copy conditions
+        let src_etag = src_meta.checksum.trim_matches('"').to_string();
+        if let Some(if_match) = headers.get("x-amz-copy-source-if-match").and_then(|h| h.to_str().ok()) {
+            let if_match = if_match.trim_matches('"');
+            if if_match != src_etag {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied, "At least one of the preconditions you specified did not hold", StatusCode::PRECONDITION_FAILED));
+            }
+        }
+        if let Some(if_none_match) = headers.get("x-amz-copy-source-if-none-match").and_then(|h| h.to_str().ok()) {
+            let if_none_match = if_none_match.trim_matches('"');
+            if if_none_match == src_etag {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied, "At least one of the preconditions you specified did not hold", StatusCode::PRECONDITION_FAILED));
+            }
+        }
+        if let Some(since) = headers.get("x-amz-copy-source-if-unmodified-since").and_then(|h| h.to_str().ok()) {
+            if let Ok(since_dt) = chrono::DateTime::parse_from_rfc2822(since).or_else(|_| {
+                chrono::DateTime::parse_from_str(since, "%a, %d %b %Y %H:%M:%S %Z")
+            }) {
+                if src_meta.created_at > since_dt.with_timezone(&chrono::Utc) {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied, "At least one of the preconditions you specified did not hold", StatusCode::PRECONDITION_FAILED));
+                }
+            }
+        }
+        if let Some(since) = headers.get("x-amz-copy-source-if-modified-since").and_then(|h| h.to_str().ok()) {
+            if let Ok(since_dt) = chrono::DateTime::parse_from_rfc2822(since).or_else(|_| {
+                chrono::DateTime::parse_from_str(since, "%a, %d %b %Y %H:%M:%S %Z")
+            }) {
+                if src_meta.created_at <= since_dt.with_timezone(&chrono::Utc) {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied, "At least one of the preconditions you specified did not hold", StatusCode::PRECONDITION_FAILED));
+                }
+            }
+        }
 
         state.storage.copy(src_bucket, &src_key, &bucket, &key).await?;
 
@@ -219,12 +369,37 @@ pub async fn put_handler(
                 .map(|s| s.trim().to_string());
 
             tracing::info!(bucket = %bucket, key = %key, "PUT Object (Streaming)");
+
+            // Detect any x-amz-checksum-* header that needs validation
+            const CHECKSUM_NAMES: &[(&str, &str)] = &[
+                ("x-amz-checksum-crc32", "crc32"),
+                ("x-amz-checksum-crc32c", "crc32c"),
+                ("x-amz-checksum-sha1", "sha1"),
+                ("x-amz-checksum-sha256", "sha256"),
+            ];
+            let provided_checksum: Option<(&str, String)> = CHECKSUM_NAMES.iter()
+                .find_map(|(hdr, algo)| {
+                    headers.get(*hdr).and_then(|h| h.to_str().ok())
+                        .map(|v| (*algo, v.to_string()))
+                });
+
             let (size, md5) = if expected_payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
                 let raw = axum::body::to_bytes(body, usize::MAX).await
                     .map_err(|e| S3Error::internal(e))?;
                 let decoded = decode_aws_chunked(&raw)
                     .map_err(|e| S3Error::internal(e))?;
+                if let Some((algo, ref expected_b64)) = provided_checksum {
+                    validate_amz_checksum(algo, &decoded, expected_b64)?;
+                }
                 state.storage.put_bytes(&bucket, &key, bytes::Bytes::from(decoded), "UNSIGNED-PAYLOAD").await
+                    .map_err(|e| S3Error::internal(e))?
+            } else if provided_checksum.is_some() {
+                // Buffer to validate checksum
+                let data = axum::body::to_bytes(body, usize::MAX).await
+                    .map_err(|e| S3Error::internal(e))?;
+                let (algo, ref expected_b64) = provided_checksum.as_ref().unwrap();
+                validate_amz_checksum(algo, &data, expected_b64)?;
+                state.storage.put_bytes(&bucket, &key, data, &expected_payload_hash).await
                     .map_err(|e| S3Error::internal(e))?
             } else {
                 state.storage.put(&bucket, &key, body, &expected_payload_hash).await
@@ -252,28 +427,69 @@ pub async fn put_handler(
                 }
             }
 
-            let metadata: HashMap<String, String> = headers.iter()
+            let mut metadata: HashMap<String, String> = headers.iter()
                 .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
+            // Store standard content headers so they're returned on GET/HEAD
+            for hdr in &["content-language", "content-disposition", "content-encoding", "cache-control", "expires"] {
+                if let Some(v) = headers.get(*hdr).and_then(|h| h.to_str().ok()) {
+                    metadata.insert(hdr.to_string(), v.to_string());
+                }
+            }
+            // Store x-amz-checksum-* headers so they can be returned on GET
+            for hdr in &["x-amz-checksum-crc32", "x-amz-checksum-crc32c", "x-amz-checksum-sha1", "x-amz-checksum-sha256"] {
+                if let Some(v) = headers.get(*hdr).and_then(|h| h.to_str().ok()) {
+                    metadata.insert(hdr.to_string(), v.to_string());
+                }
+            }
             let metadata_json = serde_json::to_string(&metadata).ok();
 
-            let storage_class = headers.get("x-amz-storage-class")
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string());
+            const VALID_STORAGE_CLASSES: &[&str] = &[
+                "STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA",
+                "INTELLIGENT_TIERING", "GLACIER", "DEEP_ARCHIVE", "GLACIER_IR",
+            ];
+            let storage_class = if let Some(sc) = headers.get("x-amz-storage-class").and_then(|h| h.to_str().ok()) {
+                if !VALID_STORAGE_CLASSES.contains(&sc) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        format!("Invalid storage class: {}", sc),
+                        StatusCode::BAD_REQUEST,
+                    ));
+                }
+                Some(sc.to_string())
+            } else {
+                None
+            };
 
             state.bucket_meta.save_object(S3ObjectMetadata {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 size,
                 content_type: headers.get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("application/octet-stream").to_string(),
-                checksum: md5,
+                checksum: md5.clone(),
                 metadata: metadata_json,
                 storage_class,
                 created_at: chrono::Utc::now(),
             }).await?;
 
-            Ok(StatusCode::OK.into_response())
+            // Build response headers: ETag + any checksum headers echoed back
+            let mut resp_headers = axum::http::HeaderMap::new();
+            resp_headers.insert(
+                axum::http::header::ETAG,
+                axum::http::HeaderValue::from_str(&format!("\"{}\"", md5)).unwrap(),
+            );
+            for hdr in &["x-amz-checksum-crc32", "x-amz-checksum-crc32c", "x-amz-checksum-sha1", "x-amz-checksum-sha256"] {
+                if let Some(v) = headers.get(*hdr).and_then(|h| h.to_str().ok()) {
+                    if let (Ok(name), Ok(val)) = (
+                        axum::http::HeaderName::from_bytes(hdr.as_bytes()),
+                        axum::http::HeaderValue::from_str(v),
+                    ) {
+                        resp_headers.insert(name, val);
+                    }
+                }
+            }
+            Ok((StatusCode::OK, resp_headers, "").into_response())
         }
     }
 }
@@ -348,6 +564,265 @@ pub async fn list_parts_handler(
     ).into_response())
 }
 
+/// Encode a single AWS Event Stream message.
+/// Format: [total_len:4BE][headers_len:4BE][prelude_crc32:4BE][headers][payload][msg_crc32:4BE]
+/// Header entry: [name_len:1][name_bytes][type:1=7 for string][value_len:2BE][value_bytes]
+/// Header names must include the ":" prefix (e.g., ":message-type").
+fn encode_event_message(event_headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+    let mut hdr_bytes: Vec<u8> = Vec::new();
+    for (name, val) in event_headers {
+        let nb = name.as_bytes();
+        let vb = val.as_bytes();
+        hdr_bytes.push(nb.len() as u8);
+        hdr_bytes.extend_from_slice(nb);
+        hdr_bytes.push(7u8); // string value type
+        hdr_bytes.extend_from_slice(&(vb.len() as u16).to_be_bytes());
+        hdr_bytes.extend_from_slice(vb);
+    }
+    let total_len = 4 + 4 + 4 + hdr_bytes.len() + payload.len() + 4;
+    let mut prelude = Vec::with_capacity(8);
+    prelude.extend_from_slice(&(total_len as u32).to_be_bytes());
+    prelude.extend_from_slice(&(hdr_bytes.len() as u32).to_be_bytes());
+    let prelude_crc = crc32fast::hash(&prelude);
+    let mut msg = Vec::with_capacity(total_len);
+    msg.extend_from_slice(&prelude);
+    msg.extend_from_slice(&prelude_crc.to_be_bytes());
+    msg.extend_from_slice(&hdr_bytes);
+    msg.extend_from_slice(payload);
+    let msg_crc = crc32fast::hash(&msg);
+    msg.extend_from_slice(&msg_crc.to_be_bytes());
+    msg
+}
+
+/// Extract a column name from an SQL identifier like `s."Name"` or `"Name"` or `Name`.
+fn extract_col_name(s: &str) -> Option<String> {
+    let s = s.trim();
+    let s = if let Some(dot) = s.rfind('.') { &s[dot + 1..] } else { s };
+    let s = s.trim().trim_matches('"').trim_matches('`');
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+/// Parse WHERE conditions from an SQL expression.
+/// Returns Vec of (column, value) equality pairs.
+fn parse_where_conditions(expr: &str) -> Vec<(String, String)> {
+    let mut conditions = Vec::new();
+    let upper = expr.to_uppercase();
+    let where_start = match upper.find(" WHERE ") {
+        Some(i) => i + 7,
+        None => return conditions,
+    };
+    let clause = &expr[where_start..];
+    // Split on " AND " case-insensitively
+    let upper_clause = clause.to_uppercase();
+    let mut start = 0;
+    let mut parts: Vec<&str> = Vec::new();
+    loop {
+        match upper_clause[start..].find(" AND ") {
+            Some(i) => { parts.push(&clause[start..start + i]); start += i + 5; }
+            None => { parts.push(&clause[start..]); break; }
+        }
+    }
+    for part in parts {
+        let part = part.trim();
+        if let Some(eq_pos) = part.find('=') {
+            let lhs = part[..eq_pos].trim();
+            let rhs = part[eq_pos + 1..].trim();
+            if let Some(col) = extract_col_name(lhs) {
+                let val = if rhs.starts_with('\'') && rhs.ends_with('\'') {
+                    rhs[1..rhs.len() - 1].to_string()
+                } else if rhs.starts_with('"') && rhs.ends_with('"') {
+                    rhs[1..rhs.len() - 1].to_string()
+                } else {
+                    rhs.to_string()
+                };
+                conditions.push((col, val));
+            }
+        }
+    }
+    conditions
+}
+
+/// Process CSV data with a SQL SELECT/WHERE expression.
+fn process_csv_select(
+    data: &str,
+    expression: &str,
+    file_header_info: &str,
+    in_field_delim: &str,
+    in_record_delim: &str,
+    out_field_delim: &str,
+    out_record_delim: &str,
+) -> Vec<u8> {
+    let in_fd = if in_field_delim.is_empty() { "," } else { in_field_delim };
+    let in_rd = if in_record_delim.is_empty() { "\n" } else { in_record_delim };
+    let out_fd = if out_field_delim.is_empty() { "," } else { out_field_delim };
+    let out_rd = if out_record_delim.is_empty() { "\n" } else { out_record_delim };
+
+    let where_conds = parse_where_conditions(expression);
+    let upper_expr = expression.to_uppercase();
+    // Detect SELECT * vs SELECT col1,col2,...
+    // Find the SELECT columns between SELECT and FROM
+    let select_all = {
+        let from_pos = upper_expr.find(" FROM ").unwrap_or(upper_expr.len());
+        let select_clause = &upper_expr[7..from_pos]; // skip "SELECT "
+        select_clause.trim() == "*"
+    };
+    let select_cols: Vec<String> = if !select_all {
+        let from_pos = upper_expr.find(" FROM ").unwrap_or(upper_expr.len());
+        expression[7..from_pos].split(',')
+            .filter_map(|c| extract_col_name(c))
+            .collect()
+    } else { Vec::new() };
+
+    let rows: Vec<&str> = data.split(in_rd).collect();
+    let (col_names, data_rows) = match file_header_info.to_uppercase().as_str() {
+        "USE" | "IGNORE" if !rows.is_empty() => {
+            let hdrs: Vec<String> = rows[0].split(in_fd).map(|s| s.trim_matches('"').to_string()).collect();
+            (hdrs, &rows[1..])
+        }
+        _ => {
+            let max = rows.iter().map(|r| r.split(in_fd).count()).max().unwrap_or(0);
+            let hdrs: Vec<String> = (1..=max).map(|i| format!("_{}", i)).collect();
+            (hdrs, &rows[..])
+        }
+    };
+
+    let mut result = Vec::new();
+    for row in data_rows {
+        if row.trim().is_empty() { continue; }
+        let fields: Vec<&str> = row.split(in_fd).collect();
+        // Build column map for WHERE evaluation
+        let row_map: HashMap<&str, &str> = col_names.iter()
+            .enumerate()
+            .filter_map(|(i, h)| fields.get(i).map(|f| (h.as_str(), *f)))
+            .collect();
+        let matches = where_conds.iter().all(|(col, val)| {
+            row_map.get(col.as_str()).map(|v| *v == val.as_str()).unwrap_or(false)
+        });
+        if matches {
+            let out_fields: Vec<&str> = if select_all {
+                fields.clone()
+            } else {
+                select_cols.iter().filter_map(|c| row_map.get(c.as_str()).copied()).collect()
+            };
+            let out_row = out_fields.join(out_fd);
+            result.extend_from_slice(out_row.as_bytes());
+            result.extend_from_slice(out_rd.as_bytes());
+        }
+    }
+    result
+}
+
+/// Handler for POST /bucket/key?select — S3 Select Object Content
+async fn select_object_content(
+    bucket: String,
+    key: String,
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, S3Error> {
+    // Parse request XML
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| S3Error::internal(e))?;
+    let body_str = std::str::from_utf8(&body_bytes).map_err(|e| S3Error::internal(e))?;
+
+    // Extract fields from XML using quick_xml
+    let mut expression = String::new();
+    let mut file_header_info = String::new();
+    let mut in_field_delim = String::from(",");
+    let mut in_record_delim = String::from("\n");
+    let mut out_field_delim = String::from(",");
+    let mut out_record_delim = String::from("\n");
+
+    let mut reader = quick_xml::Reader::from_str(body_str);
+    reader.config_mut().trim_text(true);
+    let mut current_tag = String::new();
+    let mut in_input = false;
+    let mut in_output = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = std::str::from_utf8(e.name().as_ref()).unwrap_or("").to_string();
+                match name.as_str() {
+                    "InputSerialization" => { in_input = true; in_output = false; }
+                    "OutputSerialization" => { in_output = true; in_input = false; }
+                    _ => {}
+                }
+                current_tag = name;
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name_bytes = e.name();
+                let name = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                if name == "InputSerialization" { in_input = false; }
+                if name == "OutputSerialization" { in_output = false; }
+            }
+            Ok(quick_xml::events::Event::Text(e)) => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                match current_tag.as_str() {
+                    "Expression" => { expression = text; }
+                    "FileHeaderInfo" if in_input => { file_header_info = text; }
+                    "FieldDelimiter" if in_input => { in_field_delim = text; }
+                    "RecordDelimiter" if in_input => { in_record_delim = text; }
+                    "FieldDelimiter" if in_output => { out_field_delim = text; }
+                    "RecordDelimiter" if in_output => { out_record_delim = text; }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Read the S3 object
+    let obj_body = state.storage.get(&bucket, &key).await
+        .map_err(|_| S3Error::new(S3ErrorCode::NoSuchKey, "Object not found", StatusCode::NOT_FOUND))?;
+    let obj_bytes = axum::body::to_bytes(obj_body, usize::MAX).await
+        .map_err(|e| S3Error::internal(e))?;
+    let obj_str = std::str::from_utf8(&obj_bytes).map_err(|e| S3Error::internal(e))?;
+
+    let bytes_scanned = obj_bytes.len() as u64;
+
+    // Execute the select
+    let result_data = process_csv_select(
+        obj_str, &expression, &file_header_info,
+        &in_field_delim, &in_record_delim,
+        &out_field_delim, &out_record_delim,
+    );
+
+    let bytes_returned = result_data.len() as u64;
+
+    // Build the event stream
+    let mut stream_bytes = Vec::new();
+
+    // Records event (only if there's data)
+    if !result_data.is_empty() {
+        stream_bytes.extend(encode_event_message(
+            &[(":message-type", "event"), (":event-type", "Records"), (":content-type", "application/octet-stream")],
+            &result_data,
+        ));
+    }
+
+    // Stats event (content-type must be text/xml per minio-js parser)
+    let stats_xml = format!(
+        "<Stats><BytesScanned>{}</BytesScanned><BytesProcessed>{}</BytesProcessed><BytesReturned>{}</BytesReturned></Stats>",
+        bytes_scanned, bytes_scanned, bytes_returned,
+    );
+    stream_bytes.extend(encode_event_message(
+        &[(":message-type", "event"), (":event-type", "Stats"), (":content-type", "text/xml")],
+        stats_xml.as_bytes(),
+    ));
+
+    // End event
+    stream_bytes.extend(encode_event_message(
+        &[(":message-type", "event"), (":event-type", "End")],
+        &[],
+    ));
+
+    let _ = headers; // auth already validated by caller
+    let mut resp_headers = axum::http::HeaderMap::new();
+    resp_headers.insert(axum::http::header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    Ok((StatusCode::OK, resp_headers, stream_bytes).into_response())
+}
+
 /// Unified handler for POST requests (Initiate and Complete Multipart)
 pub async fn post_handler(
     method: axum::http::Method,
@@ -356,8 +831,19 @@ pub async fn post_handler(
     Query(all_query): Query<Vec<(String, String)>>,
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    body: axum::body::Body,
 ) -> Result<impl IntoResponse, S3Error> {
     let payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // SHA256 of empty string
+
+    let query_map: HashMap<String, String> = all_query.iter().cloned().collect();
+
+    // POST /{bucket}/{key} is only valid for multipart upload operations or select.
+    // Return MethodNotAllowed before auth for any other case (e.g. malformed presigned POST URLs).
+    if !query_map.contains_key("uploads") && !query_map.contains_key("uploadId")
+        && !query_map.contains_key("select") && !query_map.contains_key("select-type")
+    {
+        return Err(S3Error::new(S3ErrorCode::MethodNotAllowed, "The specified method is not allowed against this resource.", StatusCode::METHOD_NOT_ALLOWED));
+    }
 
     // 1. Validate Auth
     let (params, _) = validate_auth(
@@ -371,14 +857,18 @@ pub async fn post_handler(
 
     super::validate_policy(&state, &params, method.as_str(), &bucket, Some(&key)).await?;
 
-    let query_map: HashMap<String, String> = all_query.iter().cloned().collect();
-
     // 2. Proceed with Logic
     if query_map.contains_key("uploads") {
-        let metadata: HashMap<String, String> = headers.iter()
+        let mut metadata: HashMap<String, String> = headers.iter()
             .filter(|(k, _)| k.as_str().starts_with("x-amz-meta-"))
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
+        // Store standard content headers so they're preserved in the final object
+        for hdr in &["content-language", "content-disposition", "content-encoding", "cache-control", "expires"] {
+            if let Some(v) = headers.get(*hdr).and_then(|h| h.to_str().ok()) {
+                metadata.insert(hdr.to_string(), v.to_string());
+            }
+        }
         let metadata_json = if metadata.is_empty() { None } else { serde_json::to_string(&metadata).ok() };
         let content_type = headers.get("content-type").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
         let storage_class = headers.get("x-amz-storage-class").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
@@ -423,13 +913,35 @@ pub async fn post_handler(
 
         tracing::info!(upload_id = %upload_id, total_size = total_size, etag = %etag, "Completing Multipart Upload ETag");
 
+        // Store part info in metadata so GetObjectAttributes can return it
+        let mut object_metadata: HashMap<String, String> = if let Some(ref mj) = upload.metadata {
+            match serde_json::from_str(mj) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(upload_id = %upload_id, metadata = %mj, error = ?e, "Failed to parse multipart upload metadata JSON");
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+        tracing::debug!(upload_id = %upload_id, metadata_keys = ?object_metadata.keys().collect::<Vec<_>>(), "Parsed multipart metadata");
+        {
+            let mut sorted_parts = upload.parts.clone();
+            sorted_parts.sort_by_key(|p| p.part_number);
+            let parts_json = serde_json::to_string(&sorted_parts.iter().map(|p| {
+                serde_json::json!({"part_number": p.part_number, "size": p.size, "checksum": p.checksum})
+            }).collect::<Vec<_>>()).unwrap_or_default();
+            object_metadata.insert("_s3_parts".to_string(), parts_json);
+        }
+
         state.bucket_meta.save_object(S3ObjectMetadata {
             bucket: bucket.clone(),
             key: key.clone(),
             size: total_size,
             content_type: upload.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
             checksum: etag.clone(),
-            metadata: upload.metadata,
+            metadata: serde_json::to_string(&object_metadata).ok(),
             storage_class: upload.storage_class,
             created_at: chrono::Utc::now(),
         }).await?;
@@ -441,13 +953,16 @@ pub async fn post_handler(
         #[serde(rename = "CompleteMultipartUploadResult")]
         #[serde(rename_all = "PascalCase")]
         struct CompleteMultipartResponse {
+            location: String,
             bucket: String,
             key: String,
             #[serde(rename = "ETag")]
             etag: String,
         }
 
+        let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("localhost");
         let response = CompleteMultipartResponse {
+            location: format!("http://{}/{}/{}", host, bucket, key),
             bucket: bucket.clone(),
             key: key.clone(),
             etag: format!("\"{}\"", etag),
@@ -460,8 +975,8 @@ pub async fn post_handler(
             format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml)
         ).into_response())
     } else if query_map.contains_key("select") || query_map.contains_key("select-type") {
-        tracing::info!(bucket = %bucket, key = %key, "Select Object Content (Not Implemented)");
-        Err(S3Error::new(S3ErrorCode::NotImplemented, "S3 Select is not implemented yet.", StatusCode::NOT_IMPLEMENTED))
+        tracing::info!(bucket = %bucket, key = %key, "Select Object Content");
+        select_object_content(bucket, key, state, headers, body).await.map(|r| r.into_response())
     } else {
         Err(S3Error::new(S3ErrorCode::InternalError, "Invalid POST request", StatusCode::BAD_REQUEST))
     }

@@ -37,6 +37,8 @@ pub enum S3ErrorCode {
     MalformedXML,
     InvalidArgument,
     NotImplemented,
+    BucketNotEmpty,
+    PreconditionFailed,
 }
 
 /// Custom Error type for our S3 Server
