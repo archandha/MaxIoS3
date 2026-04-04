@@ -1,56 +1,71 @@
-# MaxIOs3 - Enterprise Storage Server
+# MaxIOs3
 
-A high-performance, S3-compatible storage server built with Rust, Axum, and SQLite.
+A lightweight, S3-compatible object storage server built with Rust, Axum, and SQLite.
 
 ## Overview
 
-MaxIOs3 implements a robust subset of the Amazon S3 API, allowing applications to store and retrieve objects using standard S3 clients. It is designed for enterprise-grade performance and security, with a modular architecture that supports pluggable storage and metadata backends.
+MaxIOs3 implements a broad subset of the Amazon S3 API, allowing applications
+to store and retrieve objects using any standard S3 client. It is designed for
+simplicity and compatibility rather than distributed-systems scale: a single
+process, a single SQLite database for metadata, and the local file system for
+object data.
 
 ## Features
 
-- **S3 API Compatibility**: Supports core S3 operations (ListBuckets, CreateBucket, PutObject, GetObject, DeleteObject).
-- **Multipart Uploads**: Efficiently handle large files with multi-part upload support.
-- **SigV4 Authentication**: Secure request signing using AWS Signature Version 4.
-- **Bucket Policies**: Control access to buckets and objects using JSON policies.
-- **TLS/HTTPS Support**: Optional encryption for secure data transfer.
-- **SQLite Metadata**: Fast and reliable metadata storage using SQLite.
-- **Pluggable Storage**: Abstracted storage engine (defaults to FileSystem).
-- **Garbage Collection**: Automatic cleanup of stale multipart uploads.
-- **Environment Configuration**: Flexible setup via environment variables and `.env` files.
+- **Broad S3 API coverage** — bucket and object CRUD, multipart uploads,
+  CopyObject, UploadPartCopy, DeleteObjects, pre-signed URLs (GET/PUT/POST),
+  conditional GET and DELETE, byte-range GET, object tagging, bucket CORS /
+  life cycle / encryption / policy, GetObjectAttributes, S3 Select (CSV)
+- **SigV4 authentication** — AWS Signature Version 4 request signing
+- **Bucket policies** — JSON-based access control (Allow/Deny by action,
+  resource, and principal)
+- **Additional checksum algorithms** — CRC32, CRC32C, SHA-1, SHA-256 alongside
+  the standard MD5 ETag
+- **Multipart upload garbage collection** — background task cleans up stale
+  uploads after 24 hours
+- **TLS/HTTPS** — optional, via PEM certificate and key
+- **SQLite metadata** — zero-dependency metadata storage, schema created on
+  first run
+- **File system storage** — objects stored as plain files under `STORAGE_ROOT`
+- **MinIO compatibility extensions** — health/readiness endpoints, Prometheus
+  metrics stubs, `x-minio-force-delete` header, pre-signed POST policies
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust (latest stable)
-- SQLite
 
-### Running the Server
-
-```bash
-cd maxios3
-cargo run
-```
-
-The server will start on `http://0.0.0.0:3000` by default (configurable via `HOST` and `PORT` environment variables).
-
-### HTTPS Configuration
-
-To enable HTTPS, provide paths to your PEM-encoded certificate and private key:
+### Running
 
 ```bash
-export TLS_CERT=cert.pem
-export TLS_KEY=key.pem
-cargo run
+cargo build
+STORAGE_ROOT=./data DATABASE_URL=sqlite:./metadata.db ./target/debug/maxios3
 ```
 
-When both variables are set, the server will automatically switch to HTTPS mode.
+The server starts on `http://0.0.0.0:3000` by default. On first run it creates
+a default development user automatically (see [Configuration](doc/configuration.md)).
+
+### HTTPS
+
+```bash
+TLS_CERT=cert.pem TLS_KEY=key.pem ./target/debug/maxios3
+```
+
+When both variables are set the server switches to HTTPS automatically.
 
 ## Documentation
 
-Detailed documentation can be found in the [doc/](./doc/) folder:
+- [Configuration](doc/configuration.md) — environment variables, database schema, default user
+- [Unit Testing](doc/TESTING.md) — running `cargo test`, writing new tests
+- [Integration Testing with Mint](doc/Other_testing.md) — S3 compatibility test suite results
+- [Road map](doc/roadmap.md) — planned features and known limitations
 
-- [Design Goals & Architecture](./doc/design.md)
-- [Configuration](./doc/configuration.md)
-- [Unit Testing](./doc/TESTING.md)
-- [Current Status & Roadmap](./doc/status.md)
+## S3 Compatibility
+
+MaxIOs3 passes **11 of 13** MinIO Mint integration test suites (see
+[doc/Other_testing.md](doc/Other_testing.md) for the full breakdown). The two
+remaining failures are not fixable server-side:
+
+- **minio-java `getBucketCors`** — Java SDK bug: `CORSConfiguration` has no `equals()` method
+- **mc `test_admin_users`** — requires the MinIO proprietary admin API, not part of S3
