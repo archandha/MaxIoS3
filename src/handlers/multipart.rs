@@ -1026,8 +1026,7 @@ pub async fn post_handler(
         tracing::info!(upload_id = %upload_id, "Completing Multipart Upload");
         let upload: MultipartUpload = state.multipart_meta.get_multipart(upload_id).await?
             .ok_or_else(|| {
-                tracing::error!(upload_id = %upload_id, "Upload not found in metadata");
-                S3Error::new(S3ErrorCode::InternalError, "Upload not found", StatusCode::NOT_FOUND)
+                S3Error::new(S3ErrorCode::NoSuchUpload, "The specified upload does not exist.", StatusCode::NOT_FOUND)
             })?;
 
         // Check part sizes: all parts except the last must be >= 5MB
