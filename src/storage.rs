@@ -53,6 +53,10 @@ pub trait StorageEngine: Send + Sync {
     /// Writes bytes directly to an object. Returns (size, md5_hex).
     async fn put_bytes(&self, bucket: &str, key: &str, data: bytes::Bytes, expected_checksum: &str) -> Result<(u64, String)>;
 
+    /// Copies an existing object into a multipart upload part.
+    /// Returns (size, md5_hex) for use as the part ETag.
+    async fn copy_to_part(&self, src_bucket: &str, src_key: &str, upload_id: &str, part_number: u32) -> Result<(u64, String)>;
+
     /// Cleans up temporary files after a multipart upload.
     async fn cleanup_multipart(&self, upload_id: &str) -> Result<()>;
 }
@@ -240,6 +244,28 @@ impl StorageEngine for FileSystemStorage {
         let md5_hex = hex::encode(Md5::digest(&data));
         tokio::fs::write(file_path, &data).await?;
         Ok((data.len() as u64, md5_hex))
+    }
+
+    async fn copy_to_part(&self, src_bucket: &str, src_key: &str, upload_id: &str, part_number: u32) -> Result<(u64, String)> {
+        let src_path = self.get_path(src_bucket, src_key);
+        let upload_path = self.temp.join(upload_id);
+        tokio::fs::create_dir_all(&upload_path).await?;
+        let part_path = upload_path.join(part_number.to_string());
+
+        // Copy while computing MD5
+        let mut src_file = tokio::fs::File::open(&src_path).await?;
+        let mut dst_file = tokio::fs::File::create(&part_path).await?;
+        let mut md5 = Md5::new();
+        let mut total_size = 0u64;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut src_file, &mut buf).await?;
+            if n == 0 { break; }
+            dst_file.write_all(&buf[..n]).await?;
+            md5.update(&buf[..n]);
+            total_size += n as u64;
+        }
+        Ok((total_size, hex::encode(md5.finalize())))
     }
 
     async fn cleanup_multipart(&self, upload_id: &str) -> Result<()> {

@@ -80,6 +80,15 @@ struct CopyObjectResponse {
     etag: String,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename = "CopyPartResult")]
+#[serde(rename_all = "PascalCase")]
+struct CopyPartResponse {
+    last_modified: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
 /// Handler for PUT /bucket/key?tagging — set object tags
 async fn put_object_tagging(
     method: axum::http::Method,
@@ -101,7 +110,7 @@ async fn put_object_tagging(
     let body_str = std::str::from_utf8(&body_bytes).map_err(|e| S3Error::internal(e))?;
 
     // Parse <Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag>...</TagSet></Tagging>
-    let mut tags: HashMap<String, String> = HashMap::new();
+    let mut tag_pairs: Vec<(String, String)> = Vec::new();
     let mut key_buf = String::new();
     let mut val_buf = String::new();
     let mut in_key = false;
@@ -123,7 +132,7 @@ async fn put_object_tagging(
             Ok(quick_xml::events::Event::End(e)) => match e.name().as_ref() {
                 b"Key" => { in_key = false; }
                 b"Value" => { in_val = false; }
-                b"Tag" => { tags.insert(key_buf.clone(), val_buf.clone()); }
+                b"Tag" => { tag_pairs.push((key_buf.clone(), val_buf.clone())); }
                 _ => {}
             },
             Ok(quick_xml::events::Event::Eof) => break,
@@ -131,6 +140,43 @@ async fn put_object_tagging(
             _ => {}
         }
     }
+
+    // Validate: max 10 tags
+    if tag_pairs.len() > 10 {
+        return Err(S3Error::new(
+            S3ErrorCode::BadRequest,
+            "Object tags cannot be greater than 10",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    // Validate: no duplicate keys, key length <= 128, value length <= 256
+    let mut seen_keys = std::collections::HashSet::new();
+    for (k, v) in &tag_pairs {
+        if k.len() > 128 {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidTag,
+                "The TagKey you have provided is invalid",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        if v.len() > 256 {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidTag,
+                "The TagValue you have provided is invalid",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        if !seen_keys.insert(k.as_str()) {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidTag,
+                "Cannot provide multiple Tags with the same key",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+    }
+
+    let tags: HashMap<String, String> = tag_pairs.into_iter().collect();
 
     // Get existing metadata and update _s3_tags
     let mut meta = state.bucket_meta.get_object(&bucket, &key).await?
@@ -190,6 +236,46 @@ pub async fn put_handler(
     let part_number = query_map.get("partNumber").and_then(|p| p.parse::<u32>().ok());
 
     if let (Some(upload_id), Some(part_number)) = (upload_id, part_number) {
+        // Check for UploadPartCopy: uploadId + partNumber + x-amz-copy-source
+        if let Some(copy_source) = headers.get("x-amz-copy-source").and_then(|h| h.to_str().ok()) {
+            tracing::info!(upload_id = %upload_id, part = part_number, source = %copy_source, "Upload Part Copy");
+
+            let source_path = copy_source.trim_start_matches('/');
+            let (full_key, _) = source_path.split_once('?').unwrap_or((source_path, ""));
+            let (src_bucket, src_key_encoded) = full_key.split_once('/').ok_or_else(|| {
+                S3Error::new(S3ErrorCode::InvalidArgument, "Invalid copy source", StatusCode::BAD_REQUEST)
+            })?;
+            let src_key = percent_decode_str(src_key_encoded).decode_utf8_lossy().to_string();
+
+            let src_meta = state.bucket_meta.get_object(src_bucket, &src_key).await?
+                .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey, "Source object not found", StatusCode::NOT_FOUND))?;
+
+            let (size, md5) = state.storage.copy_to_part(src_bucket, &src_key, upload_id, part_number).await
+                .map_err(|e| S3Error::internal(e))?;
+
+            state.multipart_meta.save_part(upload_id, MultipartPart {
+                part_number,
+                size,
+                checksum: md5.clone(),
+            }).await?;
+
+            let now = chrono::Utc::now();
+            let response = CopyPartResponse {
+                last_modified: now.format("%Y-%m-%dT%H:%M:%S.000Z").to_string(),
+                etag: format!("\"{}\"", md5),
+            };
+            let xml = quick_xml::se::to_string(&response).map_err(|e| S3Error::internal(e))?;
+
+            // Also attach the source object's size to metadata for completeness (not strictly needed)
+            let _ = src_meta.size;
+
+            return Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml),
+            ).into_response());
+        }
+
         tracing::info!(upload_id = %upload_id, part = part_number, "Upload Part (Streaming)");
         let (size, md5) = if expected_payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
             let raw = axum::body::to_bytes(body, usize::MAX).await
@@ -443,6 +529,21 @@ pub async fn put_handler(
                     metadata.insert(hdr.to_string(), v.to_string());
                 }
             }
+            // Parse x-amz-tagging header (URL-encoded key=value pairs) and store as _s3_tags
+            if let Some(tagging) = headers.get("x-amz-tagging").and_then(|h| h.to_str().ok()) {
+                let tags: HashMap<String, String> = tagging.split('&')
+                    .filter_map(|pair| {
+                        let mut parts = pair.splitn(2, '=');
+                        let k = parts.next().map(|s| percent_encoding::percent_decode_str(s).decode_utf8_lossy().to_string())?;
+                        let v = parts.next().unwrap_or("").to_string();
+                        let v = percent_encoding::percent_decode_str(&v).decode_utf8_lossy().to_string();
+                        if k.is_empty() { None } else { Some((k, v)) }
+                    })
+                    .collect();
+                if let Ok(tags_json) = serde_json::to_string(&tags) {
+                    metadata.insert("_s3_tags".to_string(), tags_json);
+                }
+            }
             let metadata_json = serde_json::to_string(&metadata).ok();
 
             const VALID_STORAGE_CLASSES: &[&str] = &[
@@ -533,6 +634,22 @@ pub async fn list_parts_handler(
 ) -> Result<impl IntoResponse, S3Error> {
     let query_map: HashMap<String, String> = all_query.iter().cloned().collect();
     let upload_id = query_map.get("uploadId").ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument, "Missing uploadId", StatusCode::BAD_REQUEST))?;
+
+    // Validate MaxParts and PartNumberMarker (must be non-negative integers)
+    if let Some(max_parts_str) = query_map.get("max-parts") {
+        match max_parts_str.parse::<i64>() {
+            Ok(n) if n < 0 => return Err(S3Error::new(S3ErrorCode::InvalidArgument, "max-parts must be a positive integer", StatusCode::BAD_REQUEST)),
+            Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidArgument, "max-parts must be a positive integer", StatusCode::BAD_REQUEST)),
+            _ => {}
+        }
+    }
+    if let Some(marker_str) = query_map.get("part-number-marker") {
+        match marker_str.parse::<i64>() {
+            Ok(n) if n < 0 => return Err(S3Error::new(S3ErrorCode::InvalidArgument, "part-number-marker must be a positive integer", StatusCode::BAD_REQUEST)),
+            Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidArgument, "part-number-marker must be a positive integer", StatusCode::BAD_REQUEST)),
+            _ => {}
+        }
+    }
 
     let upload = state.multipart_meta.get_multipart(upload_id).await?
         .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload, "Upload not found", StatusCode::NOT_FOUND))?;
@@ -642,6 +759,22 @@ fn parse_where_conditions(expr: &str) -> Vec<(String, String)> {
     conditions
 }
 
+/// Strip outer CSV double-quotes and unescape internal "" pairs.
+fn unquote_csv_field(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        s[1..s.len() - 1].replace("\"\"", "\"")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Split a CSV row by the given delimiter, handling double-quoted fields.
+fn split_csv_row(row: &str, delim: &str) -> Vec<String> {
+    // Simple split with quote stripping — handles basic cases
+    row.split(delim).map(unquote_csv_field).collect()
+}
+
 /// Process CSV data with a SQL SELECT/WHERE expression.
 fn process_csv_select(
     data: &str,
@@ -659,29 +792,34 @@ fn process_csv_select(
 
     let where_conds = parse_where_conditions(expression);
     let upper_expr = expression.to_uppercase();
-    // Detect SELECT * vs SELECT col1,col2,...
-    // Find the SELECT columns between SELECT and FROM
-    let select_all = {
-        let from_pos = upper_expr.find(" FROM ").unwrap_or(upper_expr.len());
-        let select_clause = &upper_expr[7..from_pos]; // skip "SELECT "
-        select_clause.trim() == "*"
-    };
+    let from_pos = upper_expr.find(" FROM ").unwrap_or(upper_expr.len());
+    let select_clause = upper_expr[7..from_pos].trim(); // skip "SELECT "
+    let select_all = select_clause == "*";
     let select_cols: Vec<String> = if !select_all {
-        let from_pos = upper_expr.find(" FROM ").unwrap_or(upper_expr.len());
         expression[7..from_pos].split(',')
             .filter_map(|c| extract_col_name(c))
             .collect()
     } else { Vec::new() };
 
     let rows: Vec<&str> = data.split(in_rd).collect();
-    let (col_names, data_rows) = match file_header_info.to_uppercase().as_str() {
-        "USE" | "IGNORE" if !rows.is_empty() => {
-            let hdrs: Vec<String> = rows[0].split(in_fd).map(|s| s.trim_matches('"').to_string()).collect();
+    // col_names: the names used in the row_map for WHERE/SELECT lookup
+    // data_rows: the rows to process (may or may not skip header)
+    let (col_names, data_rows): (Vec<String>, &[&str]) = match file_header_info.to_uppercase().as_str() {
+        "USE" if !rows.is_empty() => {
+            // Header row provides column names; skip it from output
+            let hdrs = split_csv_row(rows[0], in_fd);
+            (hdrs, &rows[1..])
+        }
+        "IGNORE" if !rows.is_empty() => {
+            // Skip header row; use positional names _1, _2, ...
+            let n = rows[0].split(in_fd).count();
+            let hdrs = (1..=n).map(|i| format!("_{}", i)).collect();
             (hdrs, &rows[1..])
         }
         _ => {
+            // No header; use positional names for all rows
             let max = rows.iter().map(|r| r.split(in_fd).count()).max().unwrap_or(0);
-            let hdrs: Vec<String> = (1..=max).map(|i| format!("_{}", i)).collect();
+            let hdrs = (1..=max).map(|i| format!("_{}", i)).collect();
             (hdrs, &rows[..])
         }
     };
@@ -689,18 +827,18 @@ fn process_csv_select(
     let mut result = Vec::new();
     for row in data_rows {
         if row.trim().is_empty() { continue; }
-        let fields: Vec<&str> = row.split(in_fd).collect();
-        // Build column map for WHERE evaluation
+        let fields: Vec<String> = split_csv_row(row, in_fd);
+        // Build column map (unquoted values) for WHERE evaluation and SELECT
         let row_map: HashMap<&str, &str> = col_names.iter()
             .enumerate()
-            .filter_map(|(i, h)| fields.get(i).map(|f| (h.as_str(), *f)))
+            .filter_map(|(i, h)| fields.get(i).map(|f| (h.as_str(), f.as_str())))
             .collect();
         let matches = where_conds.iter().all(|(col, val)| {
             row_map.get(col.as_str()).map(|v| *v == val.as_str()).unwrap_or(false)
         });
         if matches {
             let out_fields: Vec<&str> = if select_all {
-                fields.clone()
+                fields.iter().map(|f| f.as_str()).collect()
             } else {
                 select_cols.iter().filter_map(|c| row_map.get(c.as_str()).copied()).collect()
             };
@@ -891,6 +1029,22 @@ pub async fn post_handler(
                 tracing::error!(upload_id = %upload_id, "Upload not found in metadata");
                 S3Error::new(S3ErrorCode::InternalError, "Upload not found", StatusCode::NOT_FOUND)
             })?;
+
+        // Check part sizes: all parts except the last must be >= 5MB
+        const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5MB
+        let mut sorted_for_check = upload.parts.clone();
+        sorted_for_check.sort_by_key(|p| p.part_number);
+        if sorted_for_check.len() > 1 {
+            for part in &sorted_for_check[..sorted_for_check.len() - 1] {
+                if part.size < MIN_PART_SIZE {
+                    return Err(S3Error::new(
+                        S3ErrorCode::EntityTooSmall,
+                        "Your proposed upload is smaller than the minimum allowed object size.",
+                        StatusCode::BAD_REQUEST,
+                    ));
+                }
+            }
+        }
 
         let part_numbers: Vec<u32> = upload.parts.iter().map(|p| p.part_number).collect();
         tracing::info!(upload_id = %upload_id, parts = ?part_numbers, "Assembling parts");

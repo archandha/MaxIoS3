@@ -39,6 +39,9 @@ pub enum S3ErrorCode {
     NotImplemented,
     BucketNotEmpty,
     PreconditionFailed,
+    BucketAlreadyOwnedByYou,
+    InvalidTag,
+    BadRequest,
 }
 
 /// Custom Error type for our S3 Server

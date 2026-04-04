@@ -676,7 +676,7 @@ pub async fn create_bucket(
 
     // PUT /bucket?<config sub-resource>: store the XML body
     const CONFIG_PUT_SUB: &[&str] = &[
-        "tagging", "acl",
+        "tagging", "acl", "cors",
         "website", "logging", "replication", "notification",
         "accelerate", "requestPayment", "encryption", "intelligent-tiering",
         "inventory", "metrics", "ownershipControls", "publicAccessBlock",
@@ -716,6 +716,14 @@ pub async fn create_bucket(
             S3ErrorCode::NotImplemented,
             "A header you provided implies functionality that is not implemented",
             StatusCode::NOT_IMPLEMENTED,
+        ));
+    }
+
+    if state.bucket_meta.bucket_exists(&bucket).await? {
+        return Err(S3Error::new(
+            S3ErrorCode::BucketAlreadyOwnedByYou,
+            "Your previous request to create the named bucket succeeded and you already own it.",
+            StatusCode::CONFLICT,
         ));
     }
 
