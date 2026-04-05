@@ -111,6 +111,19 @@ When copying an object, the destination ETag should reflect the copied content.
 Currently it inherits the source ETag, which is correct for single-part objects
 but may differ for objects that were originally uploaded via multipart.
 
+### PostgreSQL metadata backend
+
+SQLite is convenient for single-node development setups but serializes all
+writes through a single connection, which limits throughput under concurrent PUT
+load. A PostgreSQL backend (implementing the same `BucketMetadataEngine`,
+`MultipartMetadataEngine`, and `UserMetadataEngine` traits) would give
+production deployments proper concurrent writes and connection pooling.
+
+SQLite will remain supported as the default for operators who prefer a
+zero-dependency setup. Operators choosing SQLite should be aware of the
+write-serialization limitation and the lack of support for multi-node
+deployments.
+
 ---
 
 ## Medium-Term Ideas
@@ -128,11 +141,34 @@ The lifecycle XML is stored and returned correctly but expiration rules are not
 evaluated. A background task could delete objects that have passed their
 configured expiration date.
 
-### Multi-node / clustered storage backend
+### Multi-node / clustered storage backend with intelligent sharding
 
-The `StorageEngine` trait is designed to be pluggable. A distributed backend
-(e.g., backed by a networked file system or an object store like Ceph) could
-replace `FileSystemStorage` without changes to the handlers.
+The `StorageEngine` and metadata traits are designed to be pluggable. A
+multi-node deployment could use consistent hashing to assign objects to nodes,
+with any node able to handle any request by either issuing a 307 redirect to the
+owning node (transparent to all S3 clients) or proxying the request internally.
+
+Key design areas:
+
+- Cluster membership and hash-ring management (gossip or etcd-backed)
+- A `ShardedStorageEngine` that routes or proxies based on `hash(bucket/key)`
+- PostgreSQL (or a distributed KV store such as TiKV) as the shared metadata
+  layer — a prerequisite for any multi-node setup
+- Fan-out `ListObjects` that merges results across shards
+- Cross-shard `CopyObject` via a saga / two-phase approach
+- Multipart uploads pinned to a single node for the lifetime of the upload
+
+Shared-filesystem approaches (NFS, SMB) are explicitly not the target here;
+the goal is an architecture where each node owns local storage for its shard.
+
+### Content-addressable object storage
+
+Store object data under the SHA-256 content hash rather than the bucket/key
+path. The canonical key mapping lives in metadata. This enables transparent
+deduplication at the storage layer — identical content uploaded to different
+keys (or different buckets) is stored once. The SHA-256 is already computed on
+every `PutObject`, so the storage-layer change is primarily a path-layout
+decision.
 
 ### Prometheus metrics with real data
 
