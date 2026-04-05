@@ -105,6 +105,13 @@ Adding a minimal `/minio/v1/admin/` API (user add/list/remove, policy attach)
 would allow the `mc test_admin_users` test to pass and make the server
 self-contained for development environments that use `mc` as an admin tool.
 
+This API also acts as the integration point for external secrets management
+tooling. HashiCorp Vault's AWS secrets engine, Kubernetes External Secrets, and
+similar systems can call these endpoints to create and revoke short-lived
+credentials on demand without requiring any direct database access or knowledge
+of MaxIOS3 internals. The access-key / secret-key model maps directly to what
+these tools expect.
+
 ### ETag for CopyObject
 
 When copying an object, the destination ETag should reflect the copied content.
@@ -130,10 +137,30 @@ deployments.
 
 These require more design work but address real operational gaps:
 
-### Persistent user management via API
+### OIDC / STS federated authentication
 
-A proper REST API for creating and managing users and access policies, rather
-than requiring direct database writes.
+For Kubernetes and cloud-native environments, the right authentication model is
+OIDC federation via the S3 STS API (`AssumeRoleWithWebIdentity`). The flow:
+
+1. A workload authenticates with an OIDC provider (Keycloak, Dex, a Kubernetes
+   service account token issuer, etc.) and receives a JWT.
+2. The workload calls `STS AssumeRoleWithWebIdentity` with that JWT.
+3. MaxIOS3 validates the JWT against the provider's JWKS endpoint, extracts
+   claims, and maps them to a local role or policy.
+4. MaxIOS3 returns short-lived `AccessKeyId` / `SecretAccessKey` /
+   `SessionToken` credentials.
+5. The workload uses those temporary credentials for normal S3 operations.
+
+All major S3 SDKs (aws-sdk-go, boto3, aws-sdk-java, s3fs-fuse, etc.) support
+this flow natively. MinIO implements it. It is the standard path for pod-level
+storage access in Kubernetes without distributing long-lived secrets.
+
+PAM-based authentication is explicitly not planned: it couples authentication to
+the host OS, breaks in container environments, and does not map cleanly to the
+access-key / secret-key model.
+
+This feature builds on the user management API (see near-term section) and
+requires a roles/policies model to map OIDC claims to access permissions.
 
 ### Object lifecycle enforcement
 
