@@ -12,7 +12,7 @@ pub mod config;
 pub use error::{S3Error, S3ErrorCode};
 pub use metadata::{
     BucketMetadataEngine, MultipartMetadataEngine, UserMetadataEngine,
-    SqliteMetadata, S3BucketMetadata, S3ObjectMetadata, MultipartPart, S3User,
+    SqliteMetadata, PostgresMetadata, S3BucketMetadata, S3ObjectMetadata, MultipartPart, S3User,
     MultipartUpload
 };
 pub use storage::{FileSystemStorage, StorageEngine};

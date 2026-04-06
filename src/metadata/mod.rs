@@ -7,8 +7,10 @@ pub mod bucket;
 pub mod multipart;
 pub mod user;
 pub mod sqlite;
+pub mod postgres;
 
 pub use bucket::{BucketMetadataEngine, S3BucketMetadata, S3ObjectMetadata};
 pub use multipart::{MultipartMetadataEngine, MultipartPart, MultipartUpload};
 pub use user::{UserMetadataEngine, S3User};
 pub use sqlite::SqliteMetadata;
+pub use postgres::PostgresMetadata;

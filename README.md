@@ -1,14 +1,14 @@
 # MaxIOs3
 
-A lightweight, S3-compatible object storage server built with Rust, Axum, and SQLite.
+A lightweight, S3-compatible object storage server built with Rust, Axum, and SQLite or PostgreSQL.
 
 ## Overview
 
 MaxIOs3 implements a broad subset of the Amazon S3 API, allowing applications
 to store and retrieve objects using any standard S3 client. It is designed for
-simplicity and compatibility rather than distributed-systems scale: a single
-process, a single SQLite database for metadata, and the local file system for
-object data.
+simplicity and compatibility: a single process, a pluggable metadata backend
+(SQLite for zero-dependency setups, PostgreSQL for production), and the local
+file system for object data.
 
 ## Features
 
@@ -24,8 +24,9 @@ object data.
 - **Multipart upload garbage collection** — background task cleans up stale
   uploads after 24 hours
 - **TLS/HTTPS** — optional, via PEM certificate and key
-- **SQLite metadata** — zero-dependency metadata storage, schema created on
-  first run
+- **Pluggable metadata backend** — SQLite (zero-dependency, default) or
+  PostgreSQL (production, concurrent writes); selected automatically from the
+  `DATABASE_URL` scheme, schema created on first run
 - **File system storage** — objects stored as plain files under `STORAGE_ROOT`
 - **MinIO compatibility extensions** — health/readiness endpoints, Prometheus
   metrics stubs, `x-minio-force-delete` header, pre-signed POST policies
@@ -40,7 +41,12 @@ object data.
 
 ```bash
 cargo build
+
+# SQLite (default, zero-dependency)
 STORAGE_ROOT=./data DATABASE_URL=sqlite:./metadata.db ./target/debug/maxios3
+
+# PostgreSQL
+STORAGE_ROOT=./data DATABASE_URL=postgres://user:pass@localhost/maxios3db ./target/debug/maxios3
 ```
 
 The server starts on `http://0.0.0.0:3000` by default. On first run it creates

@@ -12,7 +12,8 @@ use axum::{
     extract::{Path, Query, State},
 };
 use maxios3::{
-    FileSystemStorage, SqliteMetadata,
+    FileSystemStorage, SqliteMetadata, PostgresMetadata,
+    BucketMetadataEngine, MultipartMetadataEngine,
     SignatureValidator, AppState, UserMetadataEngine,
     Config, handlers
 };
@@ -29,12 +30,27 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting S3 server with config: {:?}", config);
 
     let storage = Arc::new(FileSystemStorage::new(&config.storage_root));
-    let sqlite_meta: Arc<SqliteMetadata> = Arc::new(SqliteMetadata::new(&config.database_url).await?);
+
+    // Select metadata backend based on the DATABASE_URL scheme.
+    // postgres:// or postgresql:// → PostgreSQL; anything else → SQLite.
+    let (bucket_meta, multipart_meta, user_meta): (
+        Arc<dyn BucketMetadataEngine>,
+        Arc<dyn MultipartMetadataEngine>,
+        Arc<dyn UserMetadataEngine>,
+    ) = if config.database_url.starts_with("postgres://") || config.database_url.starts_with("postgresql://") {
+        tracing::info!("Using PostgreSQL metadata backend");
+        let meta = Arc::new(PostgresMetadata::new(&config.database_url).await?);
+        (meta.clone(), meta.clone(), meta)
+    } else {
+        tracing::info!("Using SQLite metadata backend");
+        let meta = Arc::new(SqliteMetadata::new(&config.database_url).await?);
+        (meta.clone(), meta.clone(), meta)
+    };
 
     // Create a default user for development if none exists
-    if sqlite_meta.get_user("AKIAIOSFODNN7EXAMPLE").await?.is_none() {
+    if user_meta.get_user("AKIAIOSFODNN7EXAMPLE").await?.is_none() {
         tracing::info!("Creating default development user...");
-        sqlite_meta.create_user(
+        user_meta.create_user(
             "AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "admin"
@@ -43,13 +59,11 @@ async fn main() -> anyhow::Result<()> {
 
     let auth = SignatureValidator::new();
 
-    // In our refactored architecture, SqliteMetadata implements all three traits.
-    // We share the same instance across the different metadata fields in AppState.
     let state = Arc::new(AppState {
         storage,
-        bucket_meta: sqlite_meta.clone(),
-        multipart_meta: sqlite_meta.clone(),
-        user_meta: sqlite_meta.clone(),
+        bucket_meta,
+        multipart_meta,
+        user_meta,
         auth
     });
 

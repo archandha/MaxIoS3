@@ -61,6 +61,16 @@ integration test suite:
   deletes all matching objects recursively
 - Snowball auto-extract: `x-amz-meta-snowball-auto-extract: true` on `PUT` unpacks a tar archive into individual objects
 
+### Metadata backends
+
+- **SQLite** — default, zero-dependency; schema created on first run; suitable
+  for single-node and development setups. Note: writes are serialized through a
+  single connection, limiting throughput under heavy concurrent PUT load, and
+  SQLite cannot be shared across multiple nodes.
+- **PostgreSQL** — production backend with concurrent writes and connection
+  pooling; selected automatically when `DATABASE_URL` starts with `postgres://`
+  or `postgresql://`; schema created on first run.
+
 ---
 
 ## Near-Term Improvements
@@ -117,19 +127,6 @@ these tools expect.
 When copying an object, the destination ETag should reflect the copied content.
 Currently it inherits the source ETag, which is correct for single-part objects
 but may differ for objects that were originally uploaded via multipart.
-
-### PostgreSQL metadata backend
-
-SQLite is convenient for single-node development setups but serializes all
-writes through a single connection, which limits throughput under concurrent PUT
-load. A PostgreSQL backend (implementing the same `BucketMetadataEngine`,
-`MultipartMetadataEngine`, and `UserMetadataEngine` traits) would give
-production deployments proper concurrent writes and connection pooling.
-
-SQLite will remain supported as the default for operators who prefer a
-zero-dependency setup. Operators choosing SQLite should be aware of the
-write-serialization limitation and the lack of support for multi-node
-deployments.
 
 ---
 
