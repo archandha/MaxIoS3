@@ -49,6 +49,7 @@ When adding new features, especially those related to security or data
 integrity, please add corresponding unit tests.
 
 1. Create a `tests` module at the end of your file:
+
    ```rust
    #[cfg(test)]
    mod tests {
@@ -60,6 +61,7 @@ integrity, please add corresponding unit tests.
        }
    }
    ```
+
 2. Use `assert_eq!`, `assert!`, and other standard macros to verify behavior.
 3. For complex structures like JSON, use the `serde_json::json!` macro for easy
    setup.
