@@ -21,4 +21,7 @@ pub struct S3User {
 pub trait UserMetadataEngine: Send + Sync {
     async fn get_user(&self, access_key: &str) -> Result<Option<S3User>>;
     async fn create_user(&self, access_key: &str, secret_key: &str, user_id: &str) -> Result<()>;
+    async fn list_users(&self) -> Result<Vec<S3User>>;
+    async fn delete_user(&self, access_key: &str) -> Result<()>;
+    async fn set_user_active(&self, access_key: &str, is_active: bool) -> Result<()>;
 }

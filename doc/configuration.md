@@ -112,5 +112,5 @@ On startup, if no users exist in the database, the server creates one:
 
 **Remove this user before exposing the server to untrusted networks.**
 
-To add production users, insert rows directly into the `users` table or
-implement the user management API (see [road map](roadmap.md)).
+To add production users, use the [admin API](admin-api.md) or insert rows
+directly into the `users` table.

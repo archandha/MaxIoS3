@@ -532,4 +532,36 @@ impl UserMetadataEngine for PostgresMetadata {
         .await?;
         Ok(())
     }
+
+    async fn list_users(&self) -> Result<Vec<crate::metadata::user::S3User>> {
+        let rows = sqlx::query(
+            "SELECT access_key, secret_key, user_id, is_active, created_at FROM users"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| crate::metadata::user::S3User {
+            access_key: r.get("access_key"),
+            secret_key: r.get("secret_key"),
+            user_id: r.get("user_id"),
+            is_active: r.get("is_active"),
+            created_at: r.get("created_at"),
+        }).collect())
+    }
+
+    async fn delete_user(&self, access_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM users WHERE access_key = $1")
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_user_active(&self, access_key: &str, is_active: bool) -> Result<()> {
+        sqlx::query("UPDATE users SET is_active = $1 WHERE access_key = $2")
+            .bind(is_active)
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

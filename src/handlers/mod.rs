@@ -21,6 +21,7 @@ fn query_escape(s: &str) -> String {
     out
 }
 
+pub mod admin;
 pub mod bucket;
 pub mod object;
 pub mod multipart;

@@ -53,6 +53,17 @@ integration test suite:
 - AWS Signature Version 4 (SigV4) — header and query-string variants
 - Bucket policies — Allow/Deny by action, resource ARN pattern, and principal
 
+### Admin API — user management
+
+A minimal JSON REST API at `/minio/v1/admin/` allows user accounts to be created
+and managed over HTTP without direct database access. See
+[doc/admin-api.md](admin-api.md) for the full reference.
+
+- `GET    /minio/v1/admin/listusers` — list all users
+- `PUT    /minio/v1/admin/adduser?accessKey=X` — create or replace a user
+- `DELETE /minio/v1/admin/removeuser?accessKey=X` — delete a user
+- `PUT    /minio/v1/admin/setuserinfo?accessKey=X&status=enabled|disabled` — enable or disable a user
+
 ### MinIO compatibility extensions
 
 - Health endpoints: `GET /minio/health/live`, `GET /minio/health/ready`
@@ -111,16 +122,12 @@ accepted.
 
 ### User management API
 
-Adding a minimal `/minio/v1/admin/` API (user add/list/remove, policy attach)
-would allow the `mc test_admin_users` test to pass and make the server
-self-contained for development environments that use `mc` as an admin tool.
+~~Adding a minimal `/minio/v1/admin/` API (user add/list/remove, policy attach)~~
+**Implemented.** See [doc/admin-api.md](admin-api.md) and the *Currently Implemented* section above.
 
-This API also acts as the integration point for external secrets management
-tooling. HashiCorp Vault's AWS secrets engine, Kubernetes External Secrets, and
-similar systems can call these endpoints to create and revoke short-lived
-credentials on demand without requiring any direct database access or knowledge
-of MaxIOS3 internals. The access-key / secret-key model maps directly to what
-these tools expect.
+Remaining gaps for full `mc admin` compatibility:
+- Policy attach/detach (`/minio/v1/admin/set-policy`)
+- Service account management (access-key pairs scoped to a parent user)
 
 ### ETag for CopyObject
 

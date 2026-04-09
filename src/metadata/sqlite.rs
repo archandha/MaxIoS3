@@ -463,4 +463,119 @@ impl UserMetadataEngine for SqliteMetadata {
         .await?;
         Ok(())
     }
+
+    async fn list_users(&self) -> Result<Vec<crate::metadata::user::S3User>> {
+        let rows = sqlx::query_as::<_, crate::metadata::user::S3User>(
+            "SELECT access_key, secret_key, user_id, is_active, created_at FROM users"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn delete_user(&self, access_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM users WHERE access_key = ?")
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_user_active(&self, access_key: &str, is_active: bool) -> Result<()> {
+        sqlx::query("UPDATE users SET is_active = ? WHERE access_key = ?")
+            .bind(is_active)
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::user::UserMetadataEngine;
+
+    async fn in_memory_db() -> SqliteMetadata {
+        SqliteMetadata::new("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_users_empty() {
+        let db = in_memory_db().await;
+        let users = db.list_users().await.unwrap();
+        assert!(users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_users_returns_created_user() {
+        let db = in_memory_db().await;
+        db.create_user("KEY1", "secret1", "alice").await.unwrap();
+        db.create_user("KEY2", "secret2", "bob").await.unwrap();
+
+        let users = db.list_users().await.unwrap();
+        assert_eq!(users.len(), 2);
+        let keys: Vec<&str> = users.iter().map(|u| u.access_key.as_str()).collect();
+        assert!(keys.contains(&"KEY1"));
+        assert!(keys.contains(&"KEY2"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_removes_it() {
+        let db = in_memory_db().await;
+        db.create_user("KEY1", "secret", "alice").await.unwrap();
+        assert!(db.get_user("KEY1").await.unwrap().is_some());
+
+        db.delete_user("KEY1").await.unwrap();
+        assert!(db.get_user("KEY1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_user_is_noop() {
+        let db = in_memory_db().await;
+        // Should not error on missing key
+        assert!(db.delete_user("DOESNOTEXIST").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_set_user_active_disables_user() {
+        let db = in_memory_db().await;
+        db.create_user("KEY1", "secret", "alice").await.unwrap();
+
+        db.set_user_active("KEY1", false).await.unwrap();
+        let user = db.get_user("KEY1").await.unwrap().unwrap();
+        assert!(!user.is_active);
+    }
+
+    #[tokio::test]
+    async fn test_set_user_active_re_enables_user() {
+        let db = in_memory_db().await;
+        db.create_user("KEY1", "secret", "alice").await.unwrap();
+        db.set_user_active("KEY1", false).await.unwrap();
+        db.set_user_active("KEY1", true).await.unwrap();
+
+        let user = db.get_user("KEY1").await.unwrap().unwrap();
+        assert!(user.is_active);
+    }
+
+    #[tokio::test]
+    async fn test_full_user_lifecycle() {
+        let db = in_memory_db().await;
+
+        // Create
+        db.create_user("KEY1", "secret", "alice").await.unwrap();
+        assert_eq!(db.list_users().await.unwrap().len(), 1);
+
+        // Disable
+        db.set_user_active("KEY1", false).await.unwrap();
+        assert!(!db.get_user("KEY1").await.unwrap().unwrap().is_active);
+
+        // Re-enable
+        db.set_user_active("KEY1", true).await.unwrap();
+        assert!(db.get_user("KEY1").await.unwrap().unwrap().is_active);
+
+        // Delete
+        db.delete_user("KEY1").await.unwrap();
+        assert!(db.list_users().await.unwrap().is_empty());
+    }
 }
