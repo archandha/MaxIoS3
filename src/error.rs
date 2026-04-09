@@ -117,3 +117,44 @@ impl IntoResponse for S3Error {
         ).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn test_no_such_bucket_xml_contains_code() {
+        let err = S3Error::new(S3ErrorCode::NoSuchBucket, "The bucket does not exist", StatusCode::NOT_FOUND);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let bytes = tokio::runtime::Runtime::new().unwrap().block_on(body).unwrap();
+        let xml = std::str::from_utf8(&bytes).unwrap();
+        assert!(xml.contains("<Code>NoSuchBucket</Code>"), "XML was: {}", xml);
+        assert!(xml.contains("<Message>The bucket does not exist</Message>"), "XML was: {}", xml);
+    }
+
+    #[test]
+    fn test_internal_error_returns_500() {
+        let err = S3Error::internal(anyhow::anyhow!("something broke"));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_access_denied_returns_403() {
+        let err = S3Error::new(S3ErrorCode::AccessDenied, "Forbidden", StatusCode::FORBIDDEN);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_response_content_type_is_xml() {
+        let err = S3Error::new(S3ErrorCode::NoSuchKey, "Not found", StatusCode::NOT_FOUND);
+        let response = err.into_response();
+        let ct = response.headers().get(axum::http::header::CONTENT_TYPE).unwrap();
+        assert_eq!(ct, "application/xml");
+    }
+}

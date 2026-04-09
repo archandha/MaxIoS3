@@ -1,3 +1,6 @@
+// Tests for bucket policy evaluation logic, covering principal matching, effect
+// precedence (explicit Deny overrides Allow), wildcard resources, and multi-action statements.
+
 use super::*;
 use crate::metadata::bucket::PolicyStatement;
 use serde_json::json;

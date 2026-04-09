@@ -1134,3 +1134,91 @@ pub async fn post_handler(
         Err(S3Error::new(S3ErrorCode::InternalError, "Invalid POST request", StatusCode::BAD_REQUEST))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── decode_aws_chunked ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_single_chunk() {
+        let input = b"5\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(decode_aws_chunked(input).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_decode_multiple_chunks() {
+        let input = b"5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
+        assert_eq!(decode_aws_chunked(input).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn test_decode_empty_body() {
+        let input = b"0\r\n\r\n";
+        assert_eq!(decode_aws_chunked(input).unwrap(), b"");
+    }
+
+    #[test]
+    fn test_decode_chunk_with_signature_extension() {
+        // Real AWS chunked format: size;chunk-signature=<hex>\r\n
+        let input = b"5;chunk-signature=abc123\r\nhello\r\n0;chunk-signature=xyz\r\n\r\n";
+        assert_eq!(decode_aws_chunked(input).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_decode_invalid_no_crlf() {
+        let input = b"5hello";
+        assert!(decode_aws_chunked(input).is_err());
+    }
+
+    #[test]
+    fn test_decode_invalid_hex_size() {
+        let input = b"zz\r\nhello\r\n";
+        assert!(decode_aws_chunked(input).is_err());
+    }
+
+    // ── validate_amz_checksum ─────────────────────────────────────────────────
+
+    fn sha256_b64(data: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use sha2::{Sha256, Digest};
+        BASE64.encode(Sha256::digest(data))
+    }
+
+    fn crc32_b64(data: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        BASE64.encode(crc32fast::hash(data).to_be_bytes())
+    }
+
+    #[test]
+    fn test_validate_checksum_sha256_ok() {
+        let data = b"hello world";
+        assert!(validate_amz_checksum("sha256", data, &sha256_b64(data)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_checksum_sha256_bad() {
+        let data = b"hello world";
+        let result = validate_amz_checksum("sha256", data, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_checksum_crc32_ok() {
+        let data = b"hello world";
+        assert!(validate_amz_checksum("crc32", data, &crc32_b64(data)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_checksum_crc32_bad() {
+        let data = b"hello world";
+        assert!(validate_amz_checksum("crc32", data, "AAAAAAAA").is_err());
+    }
+
+    #[test]
+    fn test_validate_checksum_unknown_algo_passthrough() {
+        // Unknown algorithms should not error — they are ignored.
+        assert!(validate_amz_checksum("adler32", b"any data", "anything").is_ok());
+    }
+}

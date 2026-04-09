@@ -400,3 +400,7 @@ impl SignatureValidator {
         Ok(calculated == decoded_sig)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/sigv4.rs"]
+mod tests;

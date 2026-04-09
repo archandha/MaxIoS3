@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Returns true only when the checksum is an actual hex SHA256 that should be verified.
 /// Sentinel values like UNSIGNED-PAYLOAD and STREAMING-AWS4-HMAC-SHA256-PAYLOAD are skipped.
-fn is_real_sha256(s: &str) -> bool {
+pub(crate) fn is_real_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -274,5 +274,163 @@ impl StorageEngine for FileSystemStorage {
             tokio::fs::remove_dir_all(upload_path).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use sha2::{Digest, Sha256};
+
+    fn make_storage() -> (FileSystemStorage, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FileSystemStorage::new(dir.path().to_str().unwrap());
+        (storage, dir)
+    }
+
+    // ── is_real_sha256 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_real_sha256_valid() {
+        let hash = "a".repeat(64);
+        assert!(is_real_sha256(&hash));
+    }
+
+    #[test]
+    fn test_is_real_sha256_uppercase_valid() {
+        let hash = "A".repeat(64);
+        assert!(is_real_sha256(&hash));
+    }
+
+    #[test]
+    fn test_is_real_sha256_sentinel_unsigned() {
+        assert!(!is_real_sha256("UNSIGNED-PAYLOAD"));
+    }
+
+    #[test]
+    fn test_is_real_sha256_sentinel_streaming() {
+        assert!(!is_real_sha256("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"));
+    }
+
+    #[test]
+    fn test_is_real_sha256_too_short() {
+        let hash = "a".repeat(63);
+        assert!(!is_real_sha256(&hash));
+    }
+
+    #[test]
+    fn test_is_real_sha256_non_hex_char() {
+        let mut hash = "a".repeat(63);
+        hash.push('g'); // 'g' is not a hex digit
+        assert!(!is_real_sha256(&hash));
+    }
+
+    // ── FileSystemStorage ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_put_bytes_and_exists_roundtrip() {
+        let (storage, _dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let data = bytes::Bytes::from("hello storage");
+        let sha = hex::encode(Sha256::digest(&data));
+        storage.put_bytes("bkt", "key.txt", data.clone(), &sha).await.unwrap();
+
+        assert!(storage.exists("bkt", "key.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_put_bytes_bad_checksum_returns_error() {
+        let (storage, _dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let data = bytes::Bytes::from("hello");
+        let wrong_sha = "a".repeat(64);
+        assert!(storage.put_bytes("bkt", "key.txt", data, &wrong_sha).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_put_checksum_mismatch_cleans_up_file() {
+        let (storage, _dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let data = Body::from("hello");
+        let wrong_sha = "a".repeat(64);
+        assert!(storage.put("bkt", "key.txt", data, &wrong_sha).await.is_err());
+        // The partial file must have been cleaned up.
+        assert!(!storage.exists("bkt", "key.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get_roundtrip() {
+        let (storage, _dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let payload = b"roundtrip data";
+        let sha = hex::encode(Sha256::digest(payload));
+        storage.put("bkt", "obj", Body::from(payload.as_ref()), &sha).await.unwrap();
+
+        let body = storage.get("bkt", "obj").await.unwrap();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_object() {
+        let (storage, _dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let data = bytes::Bytes::from("bye");
+        let sha = hex::encode(Sha256::digest(&data));
+        storage.put_bytes("bkt", "gone.txt", data, &sha).await.unwrap();
+        assert!(storage.exists("bkt", "gone.txt").await.unwrap());
+
+        storage.delete("bkt", "gone.txt").await.unwrap();
+        assert!(!storage.exists("bkt", "gone.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_directory_marker_key_stored_as_folder_sentinel() {
+        let (storage, dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let data = bytes::Bytes::from("");
+        storage.put_bytes("bkt", "prefix/", data, "UNSIGNED-PAYLOAD").await.unwrap();
+
+        // The file should be stored at bkt/prefix/$folder$, not as a directory.
+        let sentinel = dir.path().join("bkt").join("prefix").join("$folder$");
+        assert!(sentinel.exists(), "expected $folder$ sentinel file at {:?}", sentinel);
+    }
+
+    #[tokio::test]
+    async fn test_assemble_multipart_concatenates_in_order() {
+        let (storage, _dir) = make_storage();
+        storage.create_bucket("bkt").await.unwrap();
+
+        let upload_id = "test-upload-001";
+        storage.put_part(upload_id, 1, Body::from("part1"), "UNSIGNED-PAYLOAD").await.unwrap();
+        storage.put_part(upload_id, 2, Body::from("part2"), "UNSIGNED-PAYLOAD").await.unwrap();
+        storage.put_part(upload_id, 3, Body::from("part3"), "UNSIGNED-PAYLOAD").await.unwrap();
+
+        // Pass parts out of order to verify assembly sorts them.
+        storage.assemble(upload_id, "bkt", "assembled", vec![3, 1, 2]).await.unwrap();
+
+        let body = storage.get("bkt", "assembled").await.unwrap();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"part1part2part3");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_multipart_removes_temp_dir() {
+        let (storage, dir) = make_storage();
+        let upload_id = "cleanup-me";
+        storage.put_part(upload_id, 1, Body::from("data"), "UNSIGNED-PAYLOAD").await.unwrap();
+
+        let temp_path = dir.path().join(".temp").join(upload_id);
+        assert!(temp_path.exists());
+
+        storage.cleanup_multipart(upload_id).await.unwrap();
+        assert!(!temp_path.exists());
     }
 }
