@@ -75,3 +75,23 @@ remaining failures are not fixable server-side:
 
 - **minio-java `getBucketCors`** — Java SDK bug: `CORSConfiguration` has no `equals()` method
 - **mc `test_admin_users`** — requires the MinIO proprietary admin API, not part of S3
+
+## License & Disclaimer
+This project is licensed under the GNU Affero General Public License v3.0 (AGPLv3). See the 
+[LICENSE](LICENSE.md) file in the root directory for more details.
+
+*Development Transparency:* This project was developed, structured, and tested with the assistance 
+of generative AI models (Google Gemini, Anthropic Claude). While the code has been thoroughly 
+reviewed and tested by the author, no guarantee of absolute error-free operation is provided.
+
+Disclaimer / Haftungsausschluss (Germany / § 521 BGB): The software is provided "as is", without 
+warranty of any kind, express or implied. Use of the software is at your own risk. As this software 
+is provided free of charge, the author's liability under German law is limited to intent and 
+gross negligence (Vorsatz und grobe Fahrlässigkeit) according to § 521 BGB.
+
+DE: Die Software wird "wie besehen" (as-is) und ohne jegliche ausdrückliche oder stillschweigende 
+Gewährleistung zur Verfügung gestellt. Da diese Software kostenlos zur Verfügung gestellt wird, 
+ist die Haftung des Autors nach deutschem Recht auf Vorsatz und grobe Fahrlässigkeit beschränkt (§ 521 BGB). 
+Für Datenverluste, Betriebsunterbrechungen oder andere Schäden, die durch die Nutzung dieser Software entstehen, 
+wird – soweit gesetzlich zulässig – keine Haftung übernommen. Bitte teste die Software ausgiebig, 
+bevor du ihr kritische Daten anvertraust.
